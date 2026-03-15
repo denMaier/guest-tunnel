@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Build FIDO2 SSH binaries for all four platforms.
+  # The reusable workflow inherits `contents: write` from this caller.
+  build-ssh:
+    uses: ./.github/workflows/build-ssh.yml
+    permissions:
+      contents: write
+
+  release:
+    needs: [build-ssh]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build guest-tunnel release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make cross VERSION=$VERSION
+
+      - name: Download all ssh-fido2 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ssh-fido2-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate combined sha256sums.txt
+        run: |
+          cd dist
+          sha256sum \
+            guest-tunnel-darwin-amd64 \
+            guest-tunnel-darwin-arm64 \
+            guest-tunnel-linux-amd64 \
+            guest-tunnel-linux-arm64 \
+            ssh-fido2-darwin-amd64 \
+            ssh-fido2-darwin-arm64 \
+            ssh-fido2-linux-amd64 \
+            ssh-fido2-linux-arm64 \
+            > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/guest-tunnel-darwin-amd64
+            dist/guest-tunnel-darwin-arm64
+            dist/guest-tunnel-linux-amd64
+            dist/guest-tunnel-linux-arm64
+            dist/ssh-fido2-darwin-amd64
+            dist/ssh-fido2-darwin-arm64
+            dist/ssh-fido2-linux-amd64
+            dist/ssh-fido2-linux-arm64
+            dist/sha256sums.txt

@@ -16,39 +16,32 @@ import (
 	"github.com/yourusername/guest-tunnel/internal/ui"
 )
 
-// Build-time only — server config is now in config.yml, not ldflags.
-//
-// Set via:  -ldflags "-X main.Version=v1.2.3"
-var (
-	Version      = "dev"
-	SSHBinaryURL = ""
-)
+var Version = "dev"
 
 func main() {
 	var (
-		mode          = flag.String("mode", "client", "mode: client, home, home-uninstall, server, or server-uninstall")
-		configPath    = flag.String("config", "", "path to config.yml (optional — see search order in README)")
-		initFlag      = flag.Bool("init", false, "write an example config.yml to ~/.config/guest-tunnel/config.yml and exit")
-		versionFlag   = flag.Bool("version", false, "print version and exit")
-		externalAgent = flag.Bool("external-agent", false, "use existing SSH agent (KeepassXC, StrongBox, etc.) instead of YubiKey")
-		forceFlag     = flag.Bool("force", false, "skip confirmation prompts (for uninstall)")
+		mode        = flag.String("mode", "client", "mode: client, home, home-uninstall, server, or server-uninstall")
+		configPath  = flag.String("config", "", "path to config.yml (optional)")
+		initFlag    = flag.Bool("init", false, "write an example config.yml and exit")
+		versionFlag = flag.Bool("version", false, "print version and exit")
+		forceFlag   = flag.Bool("force", false, "skip confirmation prompts (for uninstall)")
+		agentSock   = flag.String("agent-sock", "", "SSH agent socket path (overrides SSH_AUTH_SOCK)")
+		identity    = flag.String("identity", "", "SSH private key file (e.g. ~/.ssh/id_ed25519)")
 	)
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: guest-tunnel [flags]\n\nFlags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nModes:\n")
-		fmt.Fprintf(os.Stderr, "  client           — connect to homeserver via VPS using YubiKey (default)\n")
+		fmt.Fprintf(os.Stderr, "  client           — connect to homeserver via VPS (default)\n")
 		fmt.Fprintf(os.Stderr, "  home             — run reverse tunnel on homeserver as systemd service\n")
 		fmt.Fprintf(os.Stderr, "  home-uninstall   — remove homeserver tunnel setup\n")
 		fmt.Fprintf(os.Stderr, "  server           — setup VPS (jump host) configuration\n")
 		fmt.Fprintf(os.Stderr, "  server-uninstall — remove VPS jump host setup\n\n")
-		fmt.Fprintf(os.Stderr, "Config file search order:\n")
-		fmt.Fprintf(os.Stderr, "  1. --config flag\n")
-		fmt.Fprintf(os.Stderr, "  2. $GUEST_TUNNEL_CONFIG env var\n")
-		fmt.Fprintf(os.Stderr, "  3. ./config.yml\n")
-		fmt.Fprintf(os.Stderr, "  4. ~/.config/guest-tunnel/config.yml\n")
-		fmt.Fprintf(os.Stderr, "  5. ~/.guest-tunnel.yml\n\n")
+		fmt.Fprintf(os.Stderr, "Authentication (client mode — pick one):\n")
+		fmt.Fprintf(os.Stderr, "  SSH_AUTH_SOCK env var   existing agent (used automatically if set)\n")
+		fmt.Fprintf(os.Stderr, "  --agent-sock <path>     explicit agent socket\n")
+		fmt.Fprintf(os.Stderr, "  --identity <path>       private key file\n\n")
 		fmt.Fprintf(os.Stderr, "Run with --init to generate a starter config.\n")
 	}
 	flag.Parse()
@@ -57,7 +50,17 @@ func main() {
 
 	switch *mode {
 	case "client":
-		runClientMode(configPath, initFlag, versionFlag, externalAgent)
+		if *versionFlag {
+			fmt.Println(Version)
+			os.Exit(0)
+		}
+		if *initFlag {
+			if err := writeExampleConfig(); err != nil {
+				ui.Fatal("Could not write example config: %v", err)
+			}
+			os.Exit(0)
+		}
+		runClient(*configPath, *agentSock, *identity)
 	case "home":
 		homeserver.Run(configPath, initFlag)
 	case "home-uninstall":
@@ -67,30 +70,16 @@ func main() {
 	case "server-uninstall":
 		server.Uninstall(configPath, forceFlag)
 	default:
-		ui.Fatal("Invalid mode: %s (use client, home, home-uninstall, server, or server-uninstall)", *mode)
+		ui.Fatal("Invalid mode: %s", *mode)
 	}
 }
 
-func runClientMode(configPath *string, initFlag *bool, versionFlag *bool, externalAgent *bool) {
-	if *versionFlag {
-		fmt.Println(Version)
-		os.Exit(0)
-	}
-
-	if *initFlag {
-		if err := writeExampleConfig(); err != nil {
-			ui.Fatal("Could not write example config: %v", err)
-		}
-		os.Exit(0)
-	}
-
-	// ------------------------------------------------------------------ //
-	// Step 2 — Load config                                                 //
-	// ------------------------------------------------------------------ //
+func runClient(configPath, agentSock, identity string) {
+	// ── Load config ───────────────────────────────────────────────────────────
 	ui.Step(1, "Loading configuration...")
-	ui.Hint("Config: %s", config.ConfigPath(*configPath))
+	ui.Hint("Config: %s", config.ConfigPath(configPath))
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		ui.Fatal("%v\n\nRun with --init to create a starter config.", err)
 	}
@@ -98,59 +87,28 @@ func runClientMode(configPath *string, initFlag *bool, versionFlag *bool, extern
 	ui.OK("Homeserver: %s@localhost:%s (via reverse tunnel)", cfg.HomeUser, cfg.TunnelPort)
 	ui.OK("SOCKS5:     %s:%s", cfg.SOCKSBind, cfg.SOCKSPort)
 
-	// ------------------------------------------------------------------ //
-	// Step 3 — Locate FIDO2-capable SSH binary                            //
-	// ------------------------------------------------------------------ //
-	ui.Step(2, "Locating FIDO2-capable SSH binary...")
-	sshBin, sshCleanup, err := agent.FindOrFetchSSH(SSHBinaryURL)
+	// ── Resolve authentication ────────────────────────────────────────────────
+	ui.Step(2, "Resolving SSH authentication...")
+
+	auth, err := agent.Resolve(agentSock, identity)
 	if err != nil {
-		ui.Fatal("Could not find a usable SSH binary: %v", err)
-	}
-	defer sshCleanup()
-	ui.OK("Using: %s", sshBin)
-
-	// ------------------------------------------------------------------ //
-	// Step 4 — Start ssh-agent and load keys                               //
-	// ------------------------------------------------------------------ //
-	if *externalAgent {
-		ui.Step(3, "Using external SSH agent (KeepassXC, StrongBox, etc.)...")
-	} else {
-		ui.Step(3, "Starting private ssh-agent and loading YubiKey resident key...")
-		ui.Hint("Touch your YubiKey when the light flashes.")
+		ui.Fatal("%v", err)
 	}
 
-	a, err := agent.Start(sshBin, *externalAgent)
-	if err != nil {
-		ui.Fatal("Failed to start ssh-agent: %v", err)
-	}
-	defer a.Stop()
-
-	if *externalAgent {
-		ui.OK("Using external agent: %s", a.SocketPath())
-	} else {
-		if err := a.LoadResidentKey(); err != nil {
-			ui.Fatal(
-				"Failed to load resident key from YubiKey: %v\n\n"+
-					"  • Make sure your YubiKey is inserted\n"+
-					"  • Make sure it has a resident FIDO2 credential (see README: Enrollment)\n"+
-					"  • On Linux, check that udev rules allow FIDO HID access without sudo",
-				err,
-			)
-		}
-		ui.OK("Resident key loaded into agent")
+	switch {
+	case auth.AgentSock != "":
+		ui.OK("Auth: agent socket %s", auth.AgentSock)
+	case auth.IdentityFile != "":
+		ui.OK("Auth: identity file %s", auth.IdentityFile)
 	}
 
-	// ------------------------------------------------------------------ //
-	// Step 5 — Establish the two-gate tunnel                              //
-	// ------------------------------------------------------------------ //
-	ui.Step(4, "Establishing two-gate SSH tunnel...")
+	// ── Establish the two-gate tunnel ─────────────────────────────────────────
+	ui.Step(3, "Establishing two-gate SSH tunnel...")
 	ui.Hint("Gate 1 → VPS        (%s@%s:%s)", cfg.VPSUser, cfg.VPSHost, cfg.VPSPort)
 	ui.Hint("Gate 2 → Homeserver (%s@localhost:%s via jump)", cfg.HomeUser, cfg.TunnelPort)
-	ui.Hint("Touch your YubiKey when prompted.")
 
 	tcfg := tunnel.Config{
-		SSHBin:     sshBin,
-		AgentSock:  a.SocketPath(),
+		Auth:       auth,
 		VPSUser:    cfg.VPSUser,
 		VPSHost:    cfg.VPSHost,
 		VPSPort:    cfg.VPSPort,
@@ -167,10 +125,8 @@ func runClientMode(configPath *string, initFlag *bool, versionFlag *bool, extern
 	defer t.Close()
 	ui.OK("Both gates cleared — tunnel is up")
 
-	// ------------------------------------------------------------------ //
-	// Step 6 — Configure proxy                                            //
-	// ------------------------------------------------------------------ //
-	ui.Step(5, "Configuring system proxy...")
+	// ── Configure proxy ───────────────────────────────────────────────────────
+	ui.Step(4, "Configuring system proxy...")
 	proxyCleanup, err := proxy.Configure(cfg.SOCKSPort)
 	if err != nil {
 		ui.Warn("Could not auto-configure proxy: %v", err)
@@ -179,10 +135,8 @@ func runClientMode(configPath *string, initFlag *bool, versionFlag *bool, extern
 		defer proxyCleanup()
 	}
 
-	// ------------------------------------------------------------------ //
-	// Step 7 — Live                                                        //
-	// ------------------------------------------------------------------ //
-	ui.Step(6, "Tunnel is live.")
+	// ── Live ──────────────────────────────────────────────────────────────────
+	ui.Step(5, "Tunnel is live.")
 	ui.PrintConnectionInfo(cfg.SOCKSBind, cfg.SOCKSPort)
 
 	sigC := make(chan os.Signal, 1)
@@ -191,10 +145,10 @@ func runClientMode(configPath *string, initFlag *bool, versionFlag *bool, extern
 	select {
 	case <-sigC:
 		fmt.Println()
-		ui.Step(7, "Shutting down and cleaning up...")
+		ui.Step(6, "Shutting down...")
 	case err := <-t.Dead():
 		ui.Warn("Tunnel exited unexpectedly: %v", err)
-		ui.Step(7, "Cleaning up...")
+		ui.Step(6, "Cleaning up...")
 	}
 
 	ui.OK("Done. Goodbye.")

@@ -6,17 +6,18 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/yourusername/guest-tunnel/internal/agent"
 )
 
 // Config holds everything needed to build the two-gate tunnel.
 type Config struct {
-	SSHBin     string
-	AgentSock  string
+	Auth       *agent.Auth
 	VPSUser    string
 	VPSHost    string
 	VPSPort    string
 	HomeUser   string
-	TunnelPort string // reverse tunnel port on VPS (e.g., 2222)
+	TunnelPort string // reverse tunnel port on VPS (e.g. 2222)
 	SOCKSPort  string
 	SOCKSBind  string
 }
@@ -38,85 +39,78 @@ func (t *Tunnel) Close() {
 	}
 }
 
-// Establish brings up:
+// Establish brings up a two-gate SOCKS5 tunnel:
 //
-//	ssh -o ProxyJump=<VPSUser>@<VPSHost> \
+//	ssh -o ProxyJump=<VPSUser>@<VPSHost>[:<VPSPort>] \
 //	    -o StrictHostKeyChecking=accept-new \
-//	    -o IdentityAgent=<AgentSock> \
-//	    -D <SOCKSPort> \
-//	    -N \
+//	    [-o IdentityAgent=<sock> | -i <keyfile>] \
+//	    -D <SOCKSBind>:<SOCKSPort> \
+//	    -N -T \
 //	    -p <TunnelPort> \
 //	    <HomeUser>@localhost
-//
-// Gate 1 (VPS) and Gate 2 (homeserver) are each individually authenticated
-// using the resident FIDO2 key held in our private agent. The user may be
-// prompted to touch the YubiKey twice — once per gate.
 func Establish(cfg Config) (*Tunnel, error) {
-	// Verify the SOCKS port is free before we start
-	if err := portFree(cfg.SOCKSBind + ":" + cfg.SOCKSPort); err != nil {
-		return nil, fmt.Errorf("SOCKS port %s:%s is already in use: %w", cfg.SOCKSBind, cfg.SOCKSPort, err)
+	sshBin, err := agent.SSHBin()
+	if err != nil {
+		return nil, err
 	}
 
-	// Build the ProxyJump string with optional non-standard port
+	if err := portFree(cfg.SOCKSBind + ":" + cfg.SOCKSPort); err != nil {
+		return nil, fmt.Errorf("SOCKS port %s:%s already in use: %w", cfg.SOCKSBind, cfg.SOCKSPort, err)
+	}
+
 	proxyJump := fmt.Sprintf("%s@%s", cfg.VPSUser, cfg.VPSHost)
 	if cfg.VPSPort != "" && cfg.VPSPort != "22" {
 		proxyJump = fmt.Sprintf("%s@%s:%s", cfg.VPSUser, cfg.VPSHost, cfg.VPSPort)
 	}
 
-	// Connect via reverse tunnel: localhost:<tunnelPort>
-	// The VPS has a reverse tunnel bound to localhost:<TunnelPort> -> homeserver:22
-	homeAddr := fmt.Sprintf("%s@localhost", cfg.HomeUser)
-	homePortArgs := []string{"-p", cfg.TunnelPort}
-
 	socksAddr := fmt.Sprintf("%s:%s", cfg.SOCKSBind, cfg.SOCKSPort)
 
 	args := []string{
 		"-o", fmt.Sprintf("ProxyJump=%s", proxyJump),
-		"-o", fmt.Sprintf("IdentityAgent=%s", cfg.AgentSock),
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "UserKnownHostsFile=/dev/null",
-		"-N",
-		"-T",
-		"-D", socksAddr,
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "LogLevel=ERROR",
+		"-N", "-T",
+		"-D", socksAddr,
+		"-p", cfg.TunnelPort,
 	}
-	args = append(args, homePortArgs...)
-	args = append(args, homeAddr)
 
-	cmd := exec.Command(cfg.SSHBin, args...)
-	cmd.Env = append(os.Environ(),
-		"SSH_AUTH_SOCK="+cfg.AgentSock,
-		// Forward the touch prompt to the terminal
-		"SSH_ASKPASS_REQUIRE=never",
-	)
+	// Auth: agent socket or identity file
+	switch {
+	case cfg.Auth.AgentSock != "":
+		args = append(args, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSock))
+	case cfg.Auth.IdentityFile != "":
+		args = append(args, "-i", cfg.Auth.IdentityFile)
+	}
+
+	args = append(args, fmt.Sprintf("%s@localhost", cfg.HomeUser))
+
+	cmd := exec.Command(sshBin, args...)
+	env := os.Environ()
+	if cfg.Auth.AgentSock != "" {
+		env = append(env, "SSH_AUTH_SOCK="+cfg.Auth.AgentSock)
+	}
+	cmd.Env = env
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start SSH: %w", err)
+		return nil, fmt.Errorf("failed to start ssh: %w", err)
 	}
 
-	// Wait for the SOCKS5 port to become available — this confirms the tunnel
-	// has cleared both gates and is ready to forward traffic.
 	if err := waitForPort(socksAddr, 30*time.Second); err != nil {
 		cmd.Process.Kill()
-		return nil, fmt.Errorf("tunnel did not come up within 30s (both gates must accept the FIDO2 key): %w", err)
+		return nil, fmt.Errorf("tunnel did not come up within 30s: %w", err)
 	}
 
 	dead := make(chan error, 1)
-	go func() {
-		dead <- cmd.Wait()
-	}()
+	go func() { dead <- cmd.Wait() }()
 
 	return &Tunnel{cmd: cmd, dead: dead}, nil
 }
-
-// -------------------------------------------------------------------------- //
-// Helpers                                                                     //
-// -------------------------------------------------------------------------- //
 
 func portFree(addr string) error {
 	ln, err := net.Listen("tcp", addr)

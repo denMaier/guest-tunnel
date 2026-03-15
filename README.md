@@ -73,6 +73,57 @@ Insert your YubiKey and touch it when prompted. Done.
 | YubiKey (FIDO2, resident key enrolled) | See enrollment below |
 | No sudo needed | Everything runs in userspace |
 
+## Embedded SSH Client
+
+### Why a bundled SSH binary?
+
+macOS ships OpenSSH without FIDO2 (`sk-*`) key type support — it is compiled against the system's Security framework rather than libfido2, and `sk-ssh-ed25519` is simply absent from `ssh -Q key`. This means resident YubiKey credentials cannot be loaded on macOS without a replacement binary.
+
+guest-tunnel handles this automatically.
+
+### How detection and fallback work
+
+At startup, guest-tunnel runs:
+
+```
+ssh -Q key | grep sk-ssh-
+```
+
+- **If it matches**: system SSH supports FIDO2 — used as-is, nothing extra downloaded.
+- **If it does not match**: guest-tunnel looks for a pre-built fallback in this order:
+  1. `$GUEST_TUNNEL_SSH` environment variable (user override — always checked first)
+  2. `./ssh-fido2-{os}-{arch}` alongside the guest-tunnel binary
+  3. `$HOME/.local/bin/ssh-fido2`
+  4. Downloads `ssh-fido2-{os}-{arch}` from the current release, verifies its SHA256 against `sha256sums.txt`, writes it to a temp directory, and deletes it on exit.
+
+If no FIDO2-capable binary can be found or downloaded, guest-tunnel exits with a clear error rather than silently using a non-FIDO2 binary.
+
+### About the bundled binary
+
+- Built from upstream [OpenSSH V_9_8_P1](https://github.com/openssh/openssh-portable/tree/V_9_8_P1)
+- Compiled with `--with-security-key-builtin=yes` — FIDO2 is embedded in the binary itself, no runtime library dependencies
+- Does **not** use `--with-libfido2` (which would require libfido2 present at runtime)
+- Verified: `ssh-fido2-{os}-{arch} -Q key` prints `sk-ssh-ed25519@openssh.com` on a clean system with no extra libraries installed
+
+### Build it locally
+
+```bash
+make ssh-local
+# Output: bin/ssh-fido2-{os}-{arch}
+```
+
+To use it as the override for local development:
+
+```bash
+GUEST_TUNNEL_SSH=./bin/ssh-fido2-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') ./dist/guest-tunnel --mode=client
+```
+
+Or place it alongside the binary so it is picked up automatically:
+
+```bash
+cp bin/ssh-fido2-darwin-arm64 dist/
+```
+
 ## Server setup
 
 ### VPS (`/etc/ssh/sshd_config` additions)
