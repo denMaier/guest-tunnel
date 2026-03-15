@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          make cross VERSION=$VERSION
+          make sha256sums
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/guest-tunnel-darwin-amd64
+            dist/guest-tunnel-darwin-arm64
+            dist/guest-tunnel-linux-amd64
+            dist/guest-tunnel-linux-arm64
+            dist/sha256sums.txt
+          generate_release_notes: true
+          body: |
+            ## Static SSH binary with FIDO2
+
+            Download `ssh-fido2-{os}-{arch}` from the release assets and place it alongside guest-tunnel,
+            or set `GUEST_TUNNEL_SSH` to point to it.
+
+            To build a static SSH with FIDO2 support:
+            ```bash
+            # On Linux with libfido2-dev installed:
+            git clone --depth 1 https://github.com/openssh/openssh-portable
+            cd openssh-portable
+            ./configure --with-libfido2 --with-security-key-native LDFLAGS=-static
+            make -j$(nproc)
+            cp ssh /path/to/ssh-fido2-linux-amd64
+            ```
