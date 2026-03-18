@@ -937,15 +937,26 @@ echo    "(Press Ctrl+C to close the tunnel)"
 echo
 
 ssh -N -L "\${PORT}:localhost:\${PORT}" homeserver &
-SSH_PID=\$!
+SSH_PID=$!
 
-for i in \$(seq 1 15); do
-    if 2>/dev/null bash -c "echo > /dev/tcp/localhost/\${PORT}"; then
-        echo -e "\${GREEN}✓ Tunnel is up — OpenCode available at http://localhost:\${PORT}\${RESET}"
-        break
-    fi
-    sleep 1
-done
+verify_tunnel() {
+    local port=$1
+    local max_attempts=${2:-15}
+    for i in $(seq 1 $max_attempts); do
+        if curl -s -o /dev/null -m 2 "http://localhost:${port}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+if verify_tunnel "${PORT}"; then
+    echo -e "${GREEN}✓ Tunnel is up — OpenCode available at http://localhost:${PORT}${RESET}"
+else
+    echo -e "${YELLOW}✗ Tunnel verification failed — SSH may have failed. Check with: ssh -v -L ${PORT}:localhost:${PORT} homeserver${RESET}"
+    exit 1
+fi
 
 wait "\$SSH_PID"
 WRAPPER_EOF
@@ -985,22 +996,30 @@ trap _cleanup INT TERM
 
 echo -e "\${GREEN}\${BOLD}Opening SOCKS5 tunnel → homeserver (localhost:\${SOCKS_PORT})\${RESET}"
 ssh -N -D "\${SOCKS_PORT}" homeserver &
-SSH_PID=\$!
+SSH_PID=$!
+
+verify_socks() {
+    local socks_port=$1
+    local max_attempts=${2:-20}
+    for i in $(seq 1 $max_attempts); do
+        if curl --socks5-hostname 127.0.0.1:${socks_port} -m 2 -s -o /dev/null http://example.com 2>/dev/null; then
+            return 0
+        fi
+        echo -n "."
+        sleep 1
+    done
+    return 1
+}
 
 echo -n "  Waiting for tunnel"
-for i in \$(seq 1 20); do
-    if 2>/dev/null bash -c "echo > /dev/tcp/localhost/\${SOCKS_PORT}"; then
-        echo -e " \${GREEN}✓\${RESET}"
-        break
-    fi
-    echo -n "."
-    sleep 1
-    if [[ \$i -eq 20 ]]; then
-        echo ""
-        echo -e "\${YELLOW}[WARN]\${RESET}  Tunnel did not become ready in 20s — SSH may have failed." >&2
-        exit 1
-    fi
-done
+if verify_socks "${SOCKS_PORT}"; then
+    echo -e " \${GREEN}✓\${RESET}"
+else
+    echo ""
+    echo -e "${YELLOW}[WARN]\${RESET}  Tunnel did not become ready — SSH may have failed." >&2
+    echo -e "${YELLOW}[HINT]\${RESET}  Check with: ssh -v -D ${SOCKS_PORT} homeserver" >&2
+    exit 1
+fi
 
 echo -e "\${GREEN}✓ SOCKS5 tunnel up on localhost:\${SOCKS_PORT}\${RESET}"
 echo ""

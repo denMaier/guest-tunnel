@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/yourusername/guest-tunnel/internal/agent"
+	"github.com/yourusername/guest-tunnel/internal/client"
 	"github.com/yourusername/guest-tunnel/internal/config"
 	homeserver "github.com/yourusername/guest-tunnel/internal/home"
 	"github.com/yourusername/guest-tunnel/internal/proxy"
@@ -20,11 +21,12 @@ var Version = "dev"
 
 func main() {
 	var (
-		mode        = flag.String("mode", "client", "mode: client, home, home-uninstall, server, or server-uninstall")
+		mode        = flag.String("mode", "client", "mode: client, client-setup, home, home-uninstall, server, or server-uninstall")
 		configPath  = flag.String("config", "", "path to config.yml (optional)")
 		initFlag    = flag.Bool("init", false, "write an example config.yml and exit")
 		versionFlag = flag.Bool("version", false, "print version and exit")
 		forceFlag   = flag.Bool("force", false, "skip confirmation prompts (for uninstall)")
+		noReconnect = flag.Bool("no-reconnect", false, "exit immediately on tunnel failure (default: auto-reconnect)")
 		agentSock   = flag.String("agent-sock", "", "SSH agent socket path (overrides SSH_AUTH_SOCK)")
 		identity    = flag.String("identity", "", "SSH private key file (e.g. ~/.ssh/id_ed25519)")
 	)
@@ -33,15 +35,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: guest-tunnel [flags]\n\nFlags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nModes:\n")
-		fmt.Fprintf(os.Stderr, "  client           — connect to homeserver via VPS (default)\n")
-		fmt.Fprintf(os.Stderr, "  home             — run reverse tunnel on homeserver as systemd service\n")
+		fmt.Fprintf(os.Stderr, "  client           — open the two-gate SOCKS5 tunnel (default)\n")
+		fmt.Fprintf(os.Stderr, "  client-setup     — write ~/.ssh/config and ~/bin helper scripts (run once)\n")
+		fmt.Fprintf(os.Stderr, "  home             — set up homeserver: tunneluser, Dropbear/OpenSSH, autossh service\n")
 		fmt.Fprintf(os.Stderr, "  home-uninstall   — remove homeserver tunnel setup\n")
-		fmt.Fprintf(os.Stderr, "  server           — setup VPS (jump host) configuration\n")
+		fmt.Fprintf(os.Stderr, "  server           — set up VPS: jumpuser, sshd hardening, fail2ban\n")
 		fmt.Fprintf(os.Stderr, "  server-uninstall — remove VPS jump host setup\n\n")
 		fmt.Fprintf(os.Stderr, "Authentication (client mode — pick one):\n")
 		fmt.Fprintf(os.Stderr, "  SSH_AUTH_SOCK env var   existing agent (used automatically if set)\n")
 		fmt.Fprintf(os.Stderr, "  --agent-sock <path>     explicit agent socket\n")
-		fmt.Fprintf(os.Stderr, "  --identity <path>       private key file\n\n")
+		fmt.Fprintf(os.Stderr, "  --identity <path>       SSH private key file\n")
+		fmt.Fprintf(os.Stderr, "  --no-reconnect          exit immediately on tunnel failure (default: auto-reconnect)\n\n")
 		fmt.Fprintf(os.Stderr, "Run with --init to generate a starter config.\n")
 	}
 	flag.Parse()
@@ -60,7 +64,9 @@ func main() {
 			}
 			os.Exit(0)
 		}
-		runClient(*configPath, *agentSock, *identity)
+		runClient(*configPath, *agentSock, *identity, *noReconnect)
+	case "client-setup":
+		client.Setup(configPath, initFlag)
 	case "home":
 		homeserver.Run(configPath, initFlag)
 	case "home-uninstall":
@@ -74,7 +80,7 @@ func main() {
 	}
 }
 
-func runClient(configPath, agentSock, identity string) {
+func runClient(configPath, agentSock, identity string, noReconnect bool) {
 	// ── Load config ───────────────────────────────────────────────────────────
 	ui.Step(1, "Loading configuration...")
 	ui.Hint("Config: %s", config.ConfigPath(configPath))
@@ -116,6 +122,7 @@ func runClient(configPath, agentSock, identity string) {
 		TunnelPort: cfg.TunnelPort,
 		SOCKSPort:  cfg.SOCKSPort,
 		SOCKSBind:  cfg.SOCKSBind,
+		Reconnect:  !noReconnect,
 	}
 
 	t, err := tunnel.Establish(tcfg)
@@ -142,13 +149,20 @@ func runClient(configPath, agentSock, identity string) {
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case <-sigC:
+	if noReconnect {
+		select {
+		case <-sigC:
+			fmt.Println()
+			ui.Step(6, "Shutting down...")
+		case err := <-t.Dead():
+			ui.Warn("Tunnel exited unexpectedly: %v", err)
+			ui.Step(6, "Cleaning up...")
+		}
+	} else {
+		ui.Hint("Tunnel will auto-reconnect on failure. Press Ctrl+C to shut down.")
+		<-sigC
 		fmt.Println()
 		ui.Step(6, "Shutting down...")
-	case err := <-t.Dead():
-		ui.Warn("Tunnel exited unexpectedly: %v", err)
-		ui.Step(6, "Cleaning up...")
 	}
 
 	ui.OK("Done. Goodbye.")

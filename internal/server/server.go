@@ -8,9 +8,18 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/config"
 	"github.com/yourusername/guest-tunnel/internal/ui"
+)
+
+const (
+	sshdConf       = "/etc/ssh/sshd_config"
+	sshdConfDropIn = "/etc/ssh/sshd_config.d"
+	cloudInitConf  = "/etc/ssh/sshd_config.d/50-cloud-init.conf"
+	markerBegin    = "# BEGIN jumpuser-tunnel-block"
+	markerEnd      = "# END jumpuser-tunnel-block"
 )
 
 func Run(configPath *string, initFlag *bool) {
@@ -41,119 +50,226 @@ func setupVPS(cfg *config.Config) {
 
 	setupJumpUser(cfg.VPSUser)
 	setupSSHKeys(cfg.VPSUser)
-	hardenSSH()
+	hardenSSH(cfg)
 	installFail2ban()
 	restartSSH()
 
 	ui.Header("VPS Setup Complete — Summary")
-	ui.Print("  • jumpuser created with /usr/sbin/nologin shell")
-	ui.Print("  • SSH hardening applied: no passwords, no root")
-	ui.Print("  • fail2ban active")
+	ui.Print("  • %s created with /usr/sbin/nologin shell", cfg.VPSUser)
+	ui.Print("  • Laptop public key installed in /home/%s/.ssh/authorized_keys", cfg.VPSUser)
+	ui.Print("  • sshd hardened: no passwords, no root, %s restricted to localhost:%s reverse tunnel", cfg.VPSUser, cfg.TunnelPort)
+	ui.Print("  • fail2ban active (ban 1h after 5 failures in 10 min)")
 	ui.Print("")
-	ui.Print("Next: Run this binary with --mode=home on the homeserver.")
+	ui.Print("Next steps:")
+	ui.Print("  1. Run this binary with --mode=home on the homeserver.")
+	ui.Print("  2. When prompted, install the tunnel service key into")
+	ui.Print("     /home/%s/.ssh/authorized_keys on THIS VPS.", cfg.VPSUser)
+	ui.Print("  3. Ensure port 22 (or your SSH port) is open in your firewall.")
 }
 
 func setupJumpUser(username string) {
-	ui.Step(1, "Creating tunnel user...")
+	ui.Step(1, fmt.Sprintf("Creating %s...", username))
 
 	if _, err := user.Lookup(username); err == nil {
-		ui.OK("User %s already exists", username)
+		ui.OK("%s already exists", username)
 		return
 	}
 
 	cmd := exec.Command("useradd", "--system", "--shell", "/usr/sbin/nologin", "--create-home", username)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		ui.Fatal("Failed to create user: %v\n%s", err, out)
+		ui.Fatal("Failed to create %s: %v\n%s", username, err, out)
 	}
 
-	ui.OK("Created user %s", username)
+	ui.OK("Created %s with /usr/sbin/nologin shell", username)
 }
 
 func setupSSHKeys(username string) {
-	ui.Step(2, "Setting up SSH authorized_keys...")
+	ui.Step(2, "Installing authorized SSH keys...")
 
 	sshDir := filepath.Join("/home", username, ".ssh")
 	authKeys := filepath.Join(sshDir, "authorized_keys")
 
-	os.MkdirAll(sshDir, 0700)
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		ui.Fatal("Failed to create %s: %v", sshDir, err)
+	}
 	os.Chown(sshDir, 0, 0)
 	os.Chmod(sshDir, 0700)
 
-	if _, err := os.Stat(authKeys); err == nil {
-		ui.OK("Authorized keys file exists")
-		printExistingKeys(authKeys)
-		return
+	existingKeys := readPublicKeys(authKeys)
+
+	if len(existingKeys) > 0 {
+		ui.OK("%d key(s) already in authorized_keys:", len(existingKeys))
+		for _, k := range existingKeys {
+			fields := strings.Fields(k)
+			comment := ""
+			if len(fields) >= 3 {
+				comment = fields[2]
+			}
+			ui.Hint("  %s", comment)
+		}
+		fmt.Println()
+		fmt.Print("  Add another key? [y/N]: ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() || strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
+			ui.OK("Skipping key installation")
+			return
+		}
 	}
 
 	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
 	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		key := strings.TrimSpace(scanner.Text())
-		if key != "" {
-			os.WriteFile(authKeys, []byte(key+"\n"), 0600)
-			os.Chown(authKeys, 0, 0)
-			os.Chmod(authKeys, 0600)
-			ui.OK("Public key installed")
+	if !scanner.Scan() {
+		ui.Warn("No input — skipping key installation")
+		return
+	}
+	key := strings.TrimSpace(scanner.Text())
+	if key == "" {
+		ui.Warn("Empty key — skipping")
+		return
+	}
+
+	for _, existing := range existingKeys {
+		if existing == key {
+			ui.OK("That key is already present — skipping")
+			return
 		}
 	}
+
+	f, err := os.OpenFile(authKeys, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		ui.Fatal("Failed to open authorized_keys: %v", err)
+	}
+	f.WriteString(key + "\n")
+	f.Close()
+
+	os.Chown(authKeys, 0, 0)
+	os.Chmod(authKeys, 0600)
+	ui.OK("Public key installed for %s", username)
 }
 
-func printExistingKeys(authKeys string) {
-	file, err := os.Open(authKeys)
+func readPublicKeys(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ssh-") || strings.HasPrefix(line, "ecdsa-") || strings.HasPrefix(line, "sk-") {
+			keys = append(keys, line)
+		}
+	}
+	return keys
+}
+
+func hardenSSH(cfg *config.Config) {
+	ui.Step(3, "Hardening /etc/ssh/sshd_config...")
+
+	timestamp := time.Now().Format("20060102150405")
+	backup := sshdConf + ".bak." + timestamp
+	if data, err := os.ReadFile(sshdConf); err == nil {
+		if err := os.WriteFile(backup, data, 0644); err != nil {
+			ui.Warn("Could not write backup %s: %v", backup, err)
+		} else {
+			ui.OK("Backed up sshd_config → %s", backup)
+		}
+	}
+
+	neutraliseCloudInit()
+	neutraliseDropIns()
+
+	setSSHDirective(sshdConf, "PasswordAuthentication", "no")
+	setSSHDirective(sshdConf, "PermitRootLogin", "no")
+	setSSHDirective(sshdConf, "ChallengeResponseAuthentication", "no")
+	setSSHDirective(sshdConf, "UsePAM", "yes")
+	ui.OK("Global sshd hardening applied")
+
+	applyMatchBlock(cfg)
+}
+
+func neutraliseCloudInit() {
+	if _, err := os.Stat(cloudInitConf); err != nil {
+		return
+	}
+	timestamp := time.Now().Format("20060102150405")
+	backup := cloudInitConf + ".bak." + timestamp
+	if data, err := os.ReadFile(cloudInitConf); err == nil {
+		os.WriteFile(backup, data, 0644)
+	}
+	os.WriteFile(cloudInitConf, []byte("PasswordAuthentication no\n"), 0644)
+	ui.OK("Neutralised %s", cloudInitConf)
+}
+
+func neutraliseDropIns() {
+	entries, err := os.ReadDir(sshdConfDropIn)
 	if err != nil {
 		return
 	}
-	defer file.Close()
-
-	count := 0
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "ssh-") {
-			count++
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".conf") {
+			continue
 		}
+		path := filepath.Join(sshdConfDropIn, e.Name())
+		if path == cloudInitConf {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lower := strings.ToLower(string(data))
+		if !strings.Contains(lower, "passwordauthentication yes") {
+			continue
+		}
+		var out []string
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.EqualFold(strings.TrimSpace(line), "passwordauthentication yes") {
+				out = append(out, "PasswordAuthentication no")
+				ui.Warn("Overrode PasswordAuthentication yes in %s", path)
+			} else {
+				out = append(out, line)
+			}
+		}
+		os.WriteFile(path, []byte(strings.Join(out, "\n")), 0644)
 	}
-	ui.OK("%d key(s) already installed", count)
 }
 
-func hardenSSH() {
-	ui.Step(3, "Hardening SSH configuration...")
-
-	conf := "/etc/ssh/sshd_config"
-	backup := conf + ".bak"
-	if _, err := os.Stat(backup); err != nil {
-		data, _ := os.ReadFile(conf)
-		os.WriteFile(backup, data, 0644)
+func setSSHDirective(path, key, value string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		ui.Warn("Cannot read %s: %v", path, err)
+		return
 	}
 
-	data, _ := os.ReadFile(conf)
 	lines := strings.Split(string(data), "\n")
-	var out []string
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			out = append(out, line)
-			continue
-		}
-
+	replaced := false
+	for i, line := range lines {
+		trimmed := strings.TrimLeft(line, "# \t")
 		lower := strings.ToLower(trimmed)
-		if strings.HasPrefix(lower, "passwordauthentication") ||
-			strings.HasPrefix(lower, "permitrootlogin") ||
-			strings.HasPrefix(lower, "challengeresponseauthentication") {
-			continue
+		if strings.HasPrefix(lower, strings.ToLower(key)+" ") ||
+			strings.HasPrefix(lower, strings.ToLower(key)+"\t") {
+			lines[i] = key + " " + value
+			replaced = true
 		}
-		out = append(out, line)
 	}
 
-	out = append(out, "", "# guest-tunnel hardening")
-	out = append(out, "PasswordAuthentication no")
-	out = append(out, "PermitRootLogin no")
-	out = append(out, "ChallengeResponseAuthentication no")
+	if !replaced {
+		lines = append(lines, key+" "+value)
+	}
 
-	matchBlock := `
-# BEGIN jumpuser-tunnel-block
-Match User jumpuser
+	os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+func applyMatchBlock(cfg *config.Config) {
+	data, err := os.ReadFile(sshdConf)
+	if err != nil {
+		ui.Fatal("Cannot read %s: %v", sshdConf, err)
+	}
+	content := string(data)
+
+	block := fmt.Sprintf(`
+%s
+Match User %s
     PasswordAuthentication no
     PubkeyAuthentication yes
     AllowAgentForwarding no
@@ -161,12 +277,25 @@ Match User jumpuser
     X11Forwarding no
     PermitTTY no
     ForceCommand /bin/false
-    PermitListen localhost:2222
-# END jumpuser-tunnel-block`
-	out = append(out, matchBlock)
+    PermitListen localhost:%s
+%s`, markerBegin, cfg.VPSUser, cfg.TunnelPort, markerEnd)
 
-	os.WriteFile(conf, []byte(strings.Join(out, "\n")), 0644)
-	ui.OK("SSH hardened")
+	if strings.Contains(content, markerBegin) {
+		start := strings.Index(content, markerBegin)
+		end := strings.Index(content, markerEnd)
+		if end >= 0 {
+			end += len(markerEnd)
+		}
+		if start >= 0 && end > start {
+			content = content[:start] + strings.TrimLeft(block, "\n") + content[end:]
+		}
+		ui.OK("jumpuser Match block updated in sshd_config")
+	} else {
+		content += block
+		ui.OK("jumpuser Match block written to sshd_config")
+	}
+
+	os.WriteFile(sshdConf, []byte(content), 0644)
 }
 
 func installFail2ban() {
@@ -174,14 +303,12 @@ func installFail2ban() {
 
 	if _, err := exec.LookPath("fail2ban-server"); err == nil {
 		ui.OK("fail2ban already installed")
+		exec.Command("systemctl", "enable", "--now", "fail2ban").Run()
 		return
 	}
 
-	cmd := exec.Command("apt-get", "update", "-qq")
-	cmd.Run()
-
-	cmd = exec.Command("apt-get", "install", "-y", "-qq", "fail2ban")
-	if out, err := cmd.CombinedOutput(); err != nil {
+	exec.Command("apt-get", "update", "-qq").Run()
+	if out, err := exec.Command("apt-get", "install", "-y", "-qq", "fail2ban").CombinedOutput(); err != nil {
 		ui.Warn("Failed to install fail2ban: %v\n%s", err, out)
 		return
 	}
@@ -197,8 +324,12 @@ backend  = systemd
 [sshd]
 enabled  = true
 port     = ssh
-logpath  = %(sshd_log)s`
+logpath  = %(sshd_log)s
+`
 		os.WriteFile(jailLocal, []byte(content), 0644)
+		ui.OK("fail2ban jail.local written")
+	} else {
+		ui.OK("jail.local already exists — not overwriting")
 	}
 
 	exec.Command("systemctl", "enable", "--now", "fail2ban").Run()
@@ -206,14 +337,24 @@ logpath  = %(sshd_log)s`
 }
 
 func restartSSH() {
-	ui.Step(5, "Restarting SSH daemon...")
+	ui.Step(5, "Validating and restarting SSH daemon...")
 
-	if err := exec.Command("sshd", "-t").Run(); err != nil {
-		ui.Fatal("SSH config validation failed: %v", err)
+	if out, err := exec.Command("sshd", "-t").CombinedOutput(); err != nil {
+		ui.Fatal("sshd_config validation failed — NOT restarting sshd.\n%s\nReview %s", out, sshdConf)
 	}
+	ui.OK("sshd_config validation passed")
 
-	exec.Command("systemctl", "restart", "sshd").Run()
-	ui.OK("SSH daemon restarted")
+	restarted := false
+	for _, unit := range []string{"ssh", "sshd", "openssh-server"} {
+		if err := exec.Command("systemctl", "restart", unit).Run(); err == nil {
+			ui.OK("sshd restarted (%s)", unit)
+			restarted = true
+			break
+		}
+	}
+	if !restarted {
+		ui.Warn("Could not restart sshd — do it manually: systemctl restart ssh")
+	}
 }
 
 func Uninstall(configPath *string, forceFlag *bool) {
@@ -232,27 +373,28 @@ func Uninstall(configPath *string, forceFlag *bool) {
 	}
 
 	ui.Header("VPS Uninstall — Removing Jump Host Configuration")
+	ui.Print("This will PERMANENTLY DELETE:")
+	ui.Print("  - %s and all files in /home/%s", username, username)
+	ui.Print("  - jumpuser Match block from sshd_config")
+	ui.Print("  (fail2ban and global hardening directives are left in place)")
+	ui.Print("")
 
-	confirmOrForce(forceFlag, "This will PERMANENTLY DELETE:")
-	ui.Print("  - jumpuser and all files in /home/%s", username)
-	ui.Print("  - SSH hardening (sshd_config will be restored)")
-	confirmOrForce(forceFlag, "")
+	confirmOrForce(forceFlag)
 
-	restoreSSHConfig()
+	removeMatchBlock()
 	removeUser(username)
+	restartSSH()
 
 	ui.Header("VPS Uninstall Complete")
-	ui.Print("  • jumpuser removed")
-	ui.Print("  • sshd_config restored")
-	ui.Print("  • fail2ban left intact (it's useful)")
+	ui.Print("  • %s removed", username)
+	ui.Print("  • jumpuser Match block removed from sshd_config")
+	ui.Print("  • sshd restarted")
+	ui.Print("  • fail2ban left intact")
 }
 
-func confirmOrForce(forceFlag *bool, msg string) {
+func confirmOrForce(forceFlag *bool) {
 	if *forceFlag {
 		return
-	}
-	if msg != "" {
-		fmt.Println(msg)
 	}
 	fmt.Print("Continue? [y/N]: ")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -265,74 +407,50 @@ func confirmOrForce(forceFlag *bool, msg string) {
 	}
 }
 
-func restoreSSHConfig() {
-	ui.Step(1, "Restoring sshd_config...")
+func removeMatchBlock() {
+	ui.Step(1, "Removing jumpuser Match block from sshd_config...")
 
-	conf := "/etc/ssh/sshd_config"
-	backup := conf + ".bak.guest-tunnel"
+	data, err := os.ReadFile(sshdConf)
+	if err != nil {
+		ui.Warn("Cannot read %s: %v", sshdConf, err)
+		return
+	}
+	content := string(data)
 
-	if _, err := os.Stat(backup); err != nil {
-		ui.Warn("No backup found at %s", backup)
-		ui.Warn("Attempting to remove guest-tunnel additions manually...")
-		removeSSHHardening()
+	if !strings.Contains(content, markerBegin) {
+		ui.OK("No jumpuser Match block found — nothing to remove")
 		return
 	}
 
-	data, _ := os.ReadFile(backup)
-	os.WriteFile(conf, data, 0644)
-	os.Rename(backup, conf+".bak")
-
-	ui.OK("sshd_config restored from backup")
-}
-
-func removeSSHHardening() {
-	conf := "/etc/ssh/sshd_config"
-	data, _ := os.ReadFile(conf)
-	lines := strings.Split(string(data), "\n")
-	var out []string
-	skip := false
-
-	for _, line := range lines {
-		if strings.Contains(line, "# BEGIN jumpuser-tunnel-block") {
-			skip = true
-			continue
-		}
-		if strings.Contains(line, "# END jumpuser-tunnel-block") {
-			skip = false
-			continue
-		}
-		if skip {
-			continue
-		}
-		if strings.Contains(line, "# guest-tunnel hardening") {
-			continue
-		}
-		if strings.TrimSpace(line) == "PasswordAuthentication no" {
-			continue
-		}
-		if strings.TrimSpace(line) == "PermitRootLogin no" {
-			continue
-		}
-		if strings.TrimSpace(line) == "ChallengeResponseAuthentication no" {
-			continue
-		}
-		out = append(out, line)
+	start := strings.Index(content, markerBegin)
+	end := strings.Index(content, markerEnd)
+	if end >= 0 {
+		end += len(markerEnd)
+	}
+	if start < 0 || end <= start {
+		ui.Warn("Malformed marker block — skipping removal")
+		return
 	}
 
-	os.WriteFile(conf, []byte(strings.Join(out, "\n")), 0644)
-	ui.OK("Removed guest-tunnel hardening additions")
+	trimStart := start
+	if trimStart > 0 && content[trimStart-1] == '\n' {
+		trimStart--
+	}
+
+	content = content[:trimStart] + content[end:]
+	os.WriteFile(sshdConf, []byte(content), 0644)
+	ui.OK("jumpuser Match block removed")
 }
 
 func removeUser(username string) {
-	ui.Step(2, "Removing user "+username+"...")
+	ui.Step(2, fmt.Sprintf("Removing user %s...", username))
 
 	if _, err := user.Lookup(username); err != nil {
 		ui.Warn("User %s does not exist", username)
 		return
 	}
 
-	cmd := exec.Command("userdel", "-r", username)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := exec.Command("userdel", "-r", username).CombinedOutput(); err != nil {
 		ui.Warn("Failed to remove user: %v\n%s", err, out)
 		return
 	}
