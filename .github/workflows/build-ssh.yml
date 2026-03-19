@@ -56,6 +56,10 @@ jobs:
       - name: Clone OpenSSH portable
         run: git clone --depth 1 -b V_9_8_P1 https://github.com/openssh/openssh-portable.git
 
+      - name: Install macOS build dependencies
+        if: matrix.os == 'darwin'
+        run: brew install autoconf automake libtool openssl@3 libfido2
+
       - name: autoreconf
         working-directory: openssh-portable
         run: autoreconf
@@ -74,10 +78,6 @@ jobs:
             --disable-pam \
             --disable-rpath \
             LDFLAGS="-static-libgcc -static-libstdc++"
-
-      - name: Install macOS build dependencies
-        if: matrix.os == 'darwin'
-        run: brew install autoconf automake libtool openssl@3 libfido2
 
       - name: Configure (macOS)
         if: matrix.os == 'darwin'
