@@ -29,6 +29,7 @@ func main() {
 		noReconnect = flag.Bool("no-reconnect", false, "exit immediately on tunnel failure (default: auto-reconnect)")
 		agentSock   = flag.String("agent-sock", "", "SSH agent socket path (overrides SSH_AUTH_SOCK)")
 		identity    = flag.String("identity", "", "SSH private key file (e.g. ~/.ssh/id_ed25519)")
+		yubikey     = flag.Bool("yubikey", false, "load resident SSH keys from a YubiKey via a local helper agent")
 	)
 
 	flag.Usage = func() {
@@ -45,6 +46,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  SSH_AUTH_SOCK env var   existing agent (used automatically if set)\n")
 		fmt.Fprintf(os.Stderr, "  --agent-sock <path>     explicit agent socket\n")
 		fmt.Fprintf(os.Stderr, "  --identity <path>       SSH private key file\n")
+		fmt.Fprintf(os.Stderr, "  --yubikey               load resident key from YubiKey\n")
 		fmt.Fprintf(os.Stderr, "  --no-reconnect          exit immediately on tunnel failure (default: auto-reconnect)\n\n")
 		fmt.Fprintf(os.Stderr, "Run with --init to generate a starter config.\n")
 	}
@@ -64,7 +66,7 @@ func main() {
 			}
 			os.Exit(0)
 		}
-		runClient(*configPath, *agentSock, *identity, *noReconnect)
+		runClient(*configPath, *agentSock, *identity, *yubikey, *noReconnect)
 	case "client-setup":
 		client.Setup(configPath, initFlag)
 	case "home":
@@ -80,7 +82,7 @@ func main() {
 	}
 }
 
-func runClient(configPath, agentSock, identity string, noReconnect bool) {
+func runClient(configPath, agentSock, identity string, yubikey, noReconnect bool) {
 	// ── Load config ───────────────────────────────────────────────────────────
 	ui.Step(1, "Loading configuration...")
 	ui.Hint("Config: %s", config.ConfigPath(configPath))
@@ -96,16 +98,19 @@ func runClient(configPath, agentSock, identity string, noReconnect bool) {
 	// ── Resolve authentication ────────────────────────────────────────────────
 	ui.Step(2, "Resolving SSH authentication...")
 
-	auth, err := agent.Resolve(agentSock, identity)
+	auth, err := agent.Resolve(agentSock, identity, yubikey)
 	if err != nil {
 		ui.Fatal("%v", err)
 	}
+	defer auth.Close()
 
 	switch {
 	case auth.AgentSock != "":
 		ui.OK("Auth: agent socket %s", auth.AgentSock)
 	case auth.IdentityFile != "":
 		ui.OK("Auth: identity file %s", auth.IdentityFile)
+	case auth.Fido2Sock != "":
+		ui.OK("Auth: YubiKey via helper agent %s", auth.Fido2Sock)
 	}
 
 	// ── Establish the two-gate tunnel ─────────────────────────────────────────
@@ -127,6 +132,7 @@ func runClient(configPath, agentSock, identity string, noReconnect bool) {
 
 	t, err := tunnel.Establish(tcfg)
 	if err != nil {
+		_ = auth.Close()
 		ui.Fatal("Failed to establish tunnel: %v", err)
 	}
 	defer t.Close()

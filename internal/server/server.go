@@ -72,6 +72,7 @@ func setupJumpUser(username string) {
 
 	if _, err := user.Lookup(username); err == nil {
 		ui.OK("%s already exists", username)
+		ensureServiceUserState(username, "/usr/sbin/nologin")
 		return
 	}
 
@@ -80,7 +81,31 @@ func setupJumpUser(username string) {
 		ui.Fatal("Failed to create %s: %v\n%s", username, err, out)
 	}
 
+	ensureServiceUserState(username, "/usr/sbin/nologin")
 	ui.OK("Created %s with /usr/sbin/nologin shell", username)
+}
+
+func ensureServiceUserState(username, shell string) {
+	// Some OpenSSH/PAM combinations reject pubkey auth for accounts that are
+	// present but password-locked. We explicitly keep the service user
+	// shell-restricted while making the account state usable for pubkey-only SSH.
+	runUsermodIfPossible(username, "--shell", shell)
+	runUsermodIfPossible(username, "--unlock")
+	runPasswdIfPossible(username, "--delete")
+}
+
+func runUsermodIfPossible(username string, args ...string) {
+	cmd := exec.Command("usermod", append(args, username)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ui.Warn("Could not update %s with usermod %s: %v\n%s", username, strings.Join(args, " "), err, out)
+	}
+}
+
+func runPasswdIfPossible(username string, args ...string) {
+	cmd := exec.Command("passwd", append(args, username)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ui.Warn("Could not update %s with passwd %s: %v\n%s", username, strings.Join(args, " "), err, out)
+	}
 }
 
 func setupSSHKeys(username string) {
@@ -98,7 +123,7 @@ func setupSSHKeys(username string) {
 	existingKeys := readPublicKeys(authKeys)
 
 	if len(existingKeys) > 0 {
-		ui.OK("%d key(s) already in authorized_keys:", len(existingKeys))
+		ui.OK("%d key(s) already in authorized_keys — preserving existing access", len(existingKeys))
 		for _, k := range existingKeys {
 			fields := strings.Fields(k)
 			comment := ""
@@ -107,13 +132,8 @@ func setupSSHKeys(username string) {
 			}
 			ui.Hint("  %s", comment)
 		}
-		fmt.Println()
-		fmt.Print("  Add another key? [y/N]: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() || strings.ToLower(strings.TrimSpace(scanner.Text())) != "y" {
-			ui.OK("Skipping key installation")
-			return
-		}
+		ui.OK("Skipping key installation on rerun")
+		return
 	}
 
 	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")

@@ -94,6 +94,7 @@ func setupTunnelUser() {
 
 	if _, err := user.Lookup("tunneluser"); err == nil {
 		ui.OK("tunneluser already exists")
+		ensureServiceUserState("tunneluser", "/usr/sbin/nologin")
 		return
 	}
 
@@ -102,7 +103,30 @@ func setupTunnelUser() {
 		ui.Fatal("Failed to create tunneluser: %v\n%s", err, out)
 	}
 
+	ensureServiceUserState("tunneluser", "/usr/sbin/nologin")
 	ui.OK("Created tunneluser")
+}
+
+func ensureServiceUserState(username, shell string) {
+	// Keep the service account non-interactive while ensuring OpenSSH does not
+	// reject it pre-auth as a fully locked account on stricter PAM setups.
+	runUsermodIfPossible(username, "--shell", shell)
+	runUsermodIfPossible(username, "--unlock")
+	runPasswdIfPossible(username, "--delete")
+}
+
+func runUsermodIfPossible(username string, args ...string) {
+	cmd := exec.Command("usermod", append(args, username)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ui.Warn("Could not update %s with usermod %s: %v\n%s", username, strings.Join(args, " "), err, out)
+	}
+}
+
+func runPasswdIfPossible(username string, args ...string) {
+	cmd := exec.Command("passwd", append(args, username)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ui.Warn("Could not update %s with passwd %s: %v\n%s", username, strings.Join(args, " "), err, out)
+	}
 }
 
 func generateSSHKey() {
@@ -134,27 +158,40 @@ func generateSSHKey() {
 func installClientPublicKey(cfg *config.Config) {
 	ui.Step(3, "Installing client public key...")
 
-	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
-	var key string
-	fmt.Scanln(&key)
-	key = strings.TrimSpace(key)
-
-	if key == "" {
-		ui.Warn("No key provided - skipping")
-		return
-	}
+	_ = cfg
 
 	akDir := "/home/tunneluser/.ssh"
 	akFile := akDir + "/authorized_keys"
 
 	os.MkdirAll(akDir, 0700)
+	os.Chown(akDir, 0, 0)
+	os.Chmod(akDir, 0700)
 
-	if _, err := os.Stat(akFile); err == nil {
-		data, _ := os.ReadFile(akFile)
-		if strings.Contains(string(data), key) {
-			ui.OK("Key already installed")
-			return
+	existingKeys := readPublicKeys(akFile)
+	if len(existingKeys) > 0 {
+		ui.OK("%d client key(s) already installed — preserving existing access", len(existingKeys))
+		for _, k := range existingKeys {
+			fields := strings.Fields(k)
+			comment := ""
+			if len(fields) >= 3 {
+				comment = fields[2]
+			}
+			ui.Hint("  %s", comment)
 		}
+		ui.OK("Skipping client key installation on rerun")
+		return
+	}
+
+	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		ui.Warn("No key provided - skipping")
+		return
+	}
+	key := strings.TrimSpace(scanner.Text())
+	if key == "" {
+		ui.Warn("No key provided - skipping")
+		return
 	}
 
 	f, err := os.OpenFile(akFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
@@ -168,6 +205,21 @@ func installClientPublicKey(cfg *config.Config) {
 	os.Chmod(akFile, 0600)
 
 	ui.OK("Client public key installed")
+}
+
+func readPublicKeys(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var keys []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ssh-") || strings.HasPrefix(line, "ecdsa-") || strings.HasPrefix(line, "sk-") {
+			keys = append(keys, line)
+		}
+	}
+	return keys
 }
 
 func testVPSConnection(cfg *config.Config) {
@@ -321,24 +373,23 @@ func sshdListenPort(fallback string) string {
 }
 
 func chooseDaemon(current sshDaemon) bool {
+	if current.kind == "dropbear" {
+		ui.Step(7, "Selecting SSH daemon...")
+		ui.OK("Dropbear already active on port %s — preserving current daemon", current.port)
+		return true
+	}
+
+	if current.kind == "openssh" {
+		ui.Step(7, "Selecting SSH daemon...")
+		ui.OK("OpenSSH already active on port %s — preserving current daemon", current.port)
+		return false
+	}
+
 	ui.Header("SSH Server Selection")
 	fmt.Println("  Choose the SSH server to run on this homeserver:")
 	fmt.Printf("  %s1) OpenSSH%s  — standard, full-featured, larger codebase\n", ui.BOLD, ui.RESET)
 	fmt.Printf("  %s2) Dropbear%s — minimal codebase (~10x smaller), separate zero-day pool\n", ui.BOLD, ui.RESET)
 	fmt.Println()
-
-	if current.kind == "dropbear" {
-		fmt.Printf("%s  Dropbear is currently active on this system.%s\n", ui.CYAN, ui.RESET)
-		fmt.Print("  Keep Dropbear? [Y/n]: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if scanner.Scan() {
-			if strings.ToLower(strings.TrimSpace(scanner.Text())) != "n" {
-				return true
-			}
-		}
-		return false
-	}
-
 	fmt.Print("  Choice [1/2, default 2 (Dropbear recommended)]: ")
 	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
@@ -375,7 +426,12 @@ func setupDropbear(currentPort string) {
 	installDropbear()
 	convertHostKey()
 
-	dbPort := promptPort(currentPort)
+	dbPort := currentPort
+	if isUnitActive("dropbear-ssh") {
+		ui.OK("Keeping existing Dropbear listen port %s", dbPort)
+	} else {
+		dbPort = promptPort(currentPort)
+	}
 
 	writeDropbearService(dbPort)
 

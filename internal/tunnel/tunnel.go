@@ -1,15 +1,22 @@
 package tunnel
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/agent"
+)
+
+var (
+	lookupSSHBin      = agent.SSHBin
+	startVerifiedConn = startVerifiedTunnelCommand
 )
 
 type Config struct {
@@ -25,17 +32,26 @@ type Config struct {
 }
 
 type Tunnel struct {
-	cmd  *exec.Cmd
-	dead chan error
+	cmd       *exec.Cmd
+	dead      chan error
+	stop      chan struct{}
+	closeOnce sync.Once
 }
 
 func (t *Tunnel) Dead() <-chan error { return t.dead }
 
 func (t *Tunnel) Close() {
-	if t.cmd != nil && t.cmd.Process != nil {
-		t.cmd.Process.Kill()
-		t.cmd.Wait()
+	if t == nil {
+		return
 	}
+	t.closeOnce.Do(func() {
+		if t.stop != nil {
+			close(t.stop)
+		}
+		if t.cmd != nil {
+			terminateTunnelCommand(t.cmd)
+		}
+	})
 }
 
 func Establish(cfg Config) (*Tunnel, error) {
@@ -46,51 +62,32 @@ func Establish(cfg Config) (*Tunnel, error) {
 }
 
 func establishOnce(cfg Config) (*Tunnel, error) {
-	sshBin, err := agent.SSHBin()
+	sshBin, err := lookupSSHBin()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := portFree(cfg.SOCKSBind + ":" + cfg.SOCKSPort); err != nil {
-		return nil, fmt.Errorf("SOCKS port %s:%s already in use: %w", cfg.SOCKSBind, cfg.SOCKSPort, err)
-	}
-
 	socksAddr := fmt.Sprintf("%s:%s", cfg.SOCKSBind, cfg.SOCKSPort)
-
-	args := buildSSHArgs(cfg, socksAddr)
-
-	cmd := exec.Command(sshBin, args...)
-	setCmdEnv(cmd, cfg)
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start ssh: %w", err)
-	}
-
-	if err := waitForPort(socksAddr, 10*time.Second); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("SOCKS port did not become ready: %w", err)
-	}
-
-	if err := verifyProxyWorks(socksAddr, "http://example.com", 20*time.Second); err != nil {
-		cmd.Process.Kill()
-		return nil, fmt.Errorf("tunnel verification failed: %w", err)
+	cmd, err := startVerifiedConn(sshBin, cfg, socksAddr, "", false)
+	if err != nil {
+		return nil, err
 	}
 
 	dead := make(chan error, 1)
 	go func() { dead <- cmd.Wait() }()
 
-	return &Tunnel{cmd: cmd, dead: dead}, nil
+	return &Tunnel{cmd: cmd, dead: dead, stop: make(chan struct{})}, nil
 }
 
 func establishWithReconnect(cfg Config) (*Tunnel, error) {
-	sshBin, err := agent.SSHBin()
+	sshBin, err := lookupSSHBin()
 	if err != nil {
 		return nil, err
 	}
 
 	socksAddr := fmt.Sprintf("%s:%s", cfg.SOCKSBind, cfg.SOCKSPort)
 
-	useControlMaster := cfg.Auth.AgentSock == "" && cfg.Auth.IdentityFile != ""
+	useControlMaster := cfg.Auth.AgentSocket() == "" && cfg.Auth.IdentityFile != ""
 
 	var controlPath string
 	if useControlMaster {
@@ -103,45 +100,39 @@ func establishWithReconnect(cfg Config) (*Tunnel, error) {
 	tunnel := &Tunnel{
 		cmd:  nil,
 		dead: make(chan error, 1),
+		stop: make(chan struct{}),
 	}
+	ready := make(chan error, 1)
 
 	go func() {
+		firstAttempt := true
 		for {
-			if err := portFree(cfg.SOCKSBind + ":" + cfg.SOCKSPort); err != nil {
-				tunnel.dead <- fmt.Errorf("SOCKS port %s:%s already in use: %w", cfg.SOCKSBind, cfg.SOCKSPort, err)
+			if tunnel.shouldStop() {
 				return
 			}
 
-			var args []string
-			if useControlMaster {
-				args = buildSSHArgsWithControlMaster(cfg, socksAddr, controlPath)
-			} else {
-				args = buildSSHArgs(cfg, socksAddr)
-			}
-
-			cmd := exec.Command(sshBin, args...)
-			setCmdEnv(cmd, cfg)
-
-			if err := cmd.Start(); err != nil {
-				tunnel.dead <- fmt.Errorf("failed to start ssh: %w", err)
-				return
-			}
-
-			if err := waitForPort(socksAddr, 10*time.Second); err != nil {
-				cmd.Process.Kill()
-				tunnel.dead <- fmt.Errorf("SOCKS port did not become ready: %w", err)
-				return
-			}
-
-			if err := verifyProxyWorks(socksAddr, "http://example.com", 20*time.Second); err != nil {
-				cmd.Process.Kill()
-				tunnel.dead <- fmt.Errorf("tunnel verification failed: %w", err)
+			cmd, err := startVerifiedConn(sshBin, cfg, socksAddr, controlPath, useControlMaster)
+			if err != nil {
+				if tunnel.shouldStop() {
+					return
+				}
+				if firstAttempt {
+					ready <- err
+				}
+				tunnel.dead <- err
 				return
 			}
 
 			tunnel.cmd = cmd
+			if firstAttempt {
+				ready <- nil
+				firstAttempt = false
+			}
 
-			err := cmd.Wait()
+			err = cmd.Wait()
+			if tunnel.shouldStop() {
+				return
+			}
 			fmt.Printf("Tunnel exited: %v. Reconnecting...\n", err)
 			if useControlMaster {
 				cleanupControlSocket(controlPath, cfg)
@@ -149,30 +140,83 @@ func establishWithReconnect(cfg Config) (*Tunnel, error) {
 		}
 	}()
 
+	if err := <-ready; err != nil {
+		return nil, err
+	}
+
 	return tunnel, nil
 }
 
-func buildSSHArgs(cfg Config, socksAddr string) []string {
-	proxyJump := fmt.Sprintf("%s@%s", cfg.VPSUser, cfg.VPSHost)
-	if cfg.VPSPort != "" && cfg.VPSPort != "22" {
-		proxyJump = fmt.Sprintf("%s@%s:%s", cfg.VPSUser, cfg.VPSHost, cfg.VPSPort)
+func (t *Tunnel) shouldStop() bool {
+	if t == nil || t.stop == nil {
+		return false
+	}
+	select {
+	case <-t.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func startVerifiedTunnelCommand(sshBin string, cfg Config, socksAddr, controlPath string, useControlMaster bool) (*exec.Cmd, error) {
+	if err := portFree(cfg.SOCKSBind + ":" + cfg.SOCKSPort); err != nil {
+		return nil, fmt.Errorf("SOCKS port %s:%s already in use: %w", cfg.SOCKSBind, cfg.SOCKSPort, err)
 	}
 
+	var args []string
+	if useControlMaster {
+		args = buildSSHArgsWithControlMaster(cfg, socksAddr, controlPath)
+	} else {
+		args = buildSSHArgs(cfg, socksAddr)
+	}
+
+	cmd := exec.Command(sshBin, args...)
+	setCmdEnv(cmd, cfg)
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start ssh: %w", err)
+	}
+
+	if err := waitForPort(socksAddr, 10*time.Second); err != nil {
+		terminateTunnelCommand(cmd)
+		return nil, fmt.Errorf("SOCKS port did not become ready: %w", err)
+	}
+
+	if err := verifyProxyWorks(socksAddr, "http://example.com", 20*time.Second); err != nil {
+		terminateTunnelCommand(cmd)
+		return nil, fmt.Errorf("tunnel verification failed: %w", err)
+	}
+
+	return cmd, nil
+}
+
+func terminateTunnelCommand(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return
+	}
+	_ = cmd.Wait()
+}
+
+func buildSSHArgs(cfg Config, socksAddr string) []string {
 	args := []string{
-		"-o", fmt.Sprintf("ProxyJump=%s", proxyJump),
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "LogLevel=ERROR",
+		"-o", fmt.Sprintf("ProxyCommand=%s", buildProxyCommand(cfg)),
 		"-N", "-T",
 		"-D", socksAddr,
 		"-p", cfg.TunnelPort,
 	}
 
 	switch {
-	case cfg.Auth.AgentSock != "":
-		args = append(args, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSock))
+	case cfg.Auth.AgentSocket() != "":
+		args = append(args, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSocket()))
 	case cfg.Auth.IdentityFile != "":
 		args = append(args, "-i", cfg.Auth.IdentityFile)
 	}
@@ -182,18 +226,13 @@ func buildSSHArgs(cfg Config, socksAddr string) []string {
 }
 
 func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []string {
-	proxyJump := fmt.Sprintf("%s@%s", cfg.VPSUser, cfg.VPSHost)
-	if cfg.VPSPort != "" && cfg.VPSPort != "22" {
-		proxyJump = fmt.Sprintf("%s@%s:%s", cfg.VPSUser, cfg.VPSHost, cfg.VPSPort)
-	}
-
 	args := []string{
-		"-o", fmt.Sprintf("ProxyJump=%s", proxyJump),
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "LogLevel=ERROR",
+		"-o", fmt.Sprintf("ProxyCommand=%s", buildProxyCommand(cfg)),
 		"-o", "ControlMaster=auto",
 		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
 		"-o", "ControlPersist=600",
@@ -203,8 +242,8 @@ func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []
 	}
 
 	switch {
-	case cfg.Auth.AgentSock != "":
-		args = append(args, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSock))
+	case cfg.Auth.AgentSocket() != "":
+		args = append(args, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSocket()))
 	case cfg.Auth.IdentityFile != "":
 		args = append(args, "-i", cfg.Auth.IdentityFile)
 	}
@@ -213,10 +252,37 @@ func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []
 	return args
 }
 
+func buildProxyCommand(cfg Config) string {
+	target := fmt.Sprintf("%s@%s", cfg.VPSUser, cfg.VPSHost)
+
+	proxy := []string{
+		"ssh",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "LogLevel=ERROR",
+	}
+
+	switch {
+	case cfg.Auth.AgentSocket() != "":
+		proxy = append(proxy, "-o", fmt.Sprintf("IdentityAgent=%s", cfg.Auth.AgentSocket()))
+	case cfg.Auth.IdentityFile != "":
+		proxy = append(proxy, "-i", cfg.Auth.IdentityFile)
+	}
+
+	if cfg.VPSPort != "" && cfg.VPSPort != "22" {
+		proxy = append(proxy, "-p", cfg.VPSPort)
+	}
+
+	proxy = append(proxy, target, "-W", "%h:%p")
+	return strings.Join(proxy, " ")
+}
+
 func setCmdEnv(cmd *exec.Cmd, cfg Config) {
 	env := os.Environ()
-	if cfg.Auth.AgentSock != "" {
-		env = append(env, "SSH_AUTH_SOCK="+cfg.Auth.AgentSock)
+	if sock := cfg.Auth.AgentSocket(); sock != "" {
+		env = append(env, "SSH_AUTH_SOCK="+sock)
 	}
 	cmd.Env = env
 	cmd.Stdin = os.Stdin

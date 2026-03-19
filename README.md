@@ -59,16 +59,16 @@ curl -fsSL \
   | grep "guest-tunnel-${OS}-${ARCH}" | sha256sum -c -
 
 chmod +x /tmp/guest-tunnel
-/tmp/guest-tunnel --mode=client
+/tmp/guest-tunnel --mode=client --yubikey
 ```
 
-Insert your YubiKey and touch it when prompted. Done.
+Insert your YubiKey, let the helper load resident keys, and touch it when prompted. Done.
 
 ## Requirements on the borrowed machine
 
 | Requirement | Notes |
 |---|---|
-| `ssh` | Used for the tunnel; if it lacks FIDO2 support, a static binary is auto-downloaded |
+| `ssh` | Used for the tunnel |
 | `ssh-agent`, `ssh-add` | Ships with OpenSSH, present everywhere |
 | YubiKey (FIDO2, resident key enrolled) | See enrollment below |
 | No sudo needed | Everything runs in userspace |
@@ -211,6 +211,49 @@ Config file search order:
 3. `./config.yml`
 4. `~/.config/guest-tunnel/config.yml`
 5. `~/.guest-tunnel.yml`
+
+## Local Apple Container Test Harness
+
+On macOS 26 with Apple silicon, you can exercise the tunnel locally with Apple's `container` CLI.
+
+The harness starts three Linux containers:
+
+- `vps`: SSH jump host
+- `home`: homeserver SSH daemon plus a reverse tunnel back to `vps`
+- `client`: runs `guest-tunnel` and validation checks
+
+The homeserver container also exposes a loopback-only HTTP page on `127.0.0.1:8080`. The smoke test reaches that page through the SOCKS proxy, which proves Gate 2 is really working instead of just opening a local port.
+
+Run the happy-path check:
+
+```bash
+./scripts/apple-container-integration.sh smoke
+```
+
+Run the broader regression set:
+
+```bash
+./scripts/apple-container-integration.sh test
+```
+
+That test set currently covers:
+
+- happy path: tunnel comes up and can fetch the homeserver-only page
+- wrong tunnel port: startup must fail and must not print `tunnel is up`
+- wrong VPS user: startup must fail and must not print `tunnel is up`
+- local SOCKS port conflict: startup must fail and must not print `tunnel is up`
+
+Useful helper commands:
+
+```bash
+./scripts/apple-container-integration.sh up
+./scripts/apple-container-integration.sh logs
+./scripts/apple-container-integration.sh logs client
+./scripts/apple-container-integration.sh shell-client
+./scripts/apple-container-integration.sh down
+```
+
+The underlying images are still built from the Dockerfiles in [test/docker/client/Dockerfile](/Users/denis/Projects/Tunnel/test/docker/client/Dockerfile) and [test/docker/sshd/Dockerfile](/Users/denis/Projects/Tunnel/test/docker/sshd/Dockerfile), because Apple's `container build` consumes Dockerfiles directly.
 
 ### Repository secrets for GitHub Actions release
 
