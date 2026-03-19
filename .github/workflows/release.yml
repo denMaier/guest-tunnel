@@ -34,7 +34,7 @@ jobs:
       - name: Build guest-tunnel release binaries
         env:
           VERSION: ${{ github.ref_name }}
-        run: make cross VERSION=$VERSION
+        run: make cross VERSION="$VERSION"
 
       - name: Download all ssh-fido2 artifacts
         uses: actions/download-artifact@v6

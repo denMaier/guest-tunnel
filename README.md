@@ -6,7 +6,7 @@ Authenticated SOCKS5 tunnel to your homelab from any borrowed machine — no sud
 
 1. You `curl` a single pre-compiled binary (no install, runs from `/tmp`)
 2. The binary starts a private `ssh-agent` in memory
-3. Your YubiKey's resident FIDO2 key is loaded into that agent (never written to disk)
+3. A bundled `fido2-agent` helper uses `ssh-add -K` to load your YubiKey's resident FIDO2 key into that agent (never written to disk)
 4. SSH authenticates through two independent gates — VPS jump host, then homeserver — each requiring the FIDO2 key
 5. A SOCKS5 proxy comes up on `localhost:1080`
 6. On exit, the agent is killed and all temp files are wiped
@@ -53,14 +53,17 @@ curl -fsSL \
   https://github.com/yourusername/guest-tunnel/releases/download/${VERSION}/guest-tunnel-${OS}-${ARCH} \
   -o /tmp/guest-tunnel
 
-# Verify hash BEFORE running (download the sha256sums.txt from the release page)
-curl -fsSL \
-  https://github.com/yourusername/guest-tunnel/releases/download/${VERSION}/sha256sums.txt \
-  | grep "guest-tunnel-${OS}-${ARCH}" | sha256sum -c -
-
 chmod +x /tmp/guest-tunnel
 /tmp/guest-tunnel --mode=client --yubikey
 ```
+
+Before you run it, open the GitHub release page in your browser, copy the SHA256 shown for the exact binary you downloaded, and compare it locally:
+
+```bash
+shasum -a 256 /tmp/guest-tunnel
+```
+
+If the hash in your browser does not match the hash of the file you downloaded, do not run it.
 
 Insert your YubiKey, let the helper load resident keys, and touch it when prompted. Done.
 
@@ -68,60 +71,49 @@ Insert your YubiKey, let the helper load resident keys, and touch it when prompt
 
 | Requirement | Notes |
 |---|---|
-| `ssh` | Used for the tunnel |
-| `ssh-agent`, `ssh-add` | Ships with OpenSSH, present everywhere |
+| `ssh`, `ssh-agent`, `ssh-add` | Used for the tunnel and loaded by the bundled helper |
 | YubiKey (FIDO2, resident key enrolled) | See enrollment below |
 | No sudo needed | Everything runs in userspace |
 
-## Embedded SSH Client
+## Embedded FIDO2 Helper
 
-### Why a bundled SSH binary?
+### Why bundle a helper?
 
-macOS ships OpenSSH without FIDO2 (`sk-*`) key type support — it is compiled against the system's Security framework rather than libfido2, and `sk-ssh-ed25519` is simply absent from `ssh -Q key`. This means resident YubiKey credentials cannot be loaded on macOS without a replacement binary.
-
-guest-tunnel handles this automatically.
+macOS and other borrowed machines do not always have a FIDO2-capable SSH stack available. To keep the client path reliable, guest-tunnel bundles a tiny `fido2-agent` helper that launches a private `ssh-agent` and uses the FIDO2-enabled bits needed to talk to a YubiKey resident key.
 
 ### How detection and fallback work
 
-At startup, guest-tunnel runs:
+- **If `--yubikey` is set**: guest-tunnel starts the bundled helper path:
+  1. `./fido2-agent` alongside the guest-tunnel binary
+  2. `$HOME/.local/bin/fido2-agent`
+  3. A downloaded `fido2-agent-{os}-{arch}` from the current release, which you can verify by comparing its SHA256 to the value shown on the GitHub release page, written to a temp directory, and deleted on exit.
 
-```
-ssh -Q key | grep sk-ssh-
-```
+If no FIDO2-capable helper can be found or downloaded, guest-tunnel exits with a clear error rather than silently falling back to a non-FIDO2 path.
 
-- **If it matches**: system SSH supports FIDO2 — used as-is, nothing extra downloaded.
-- **If it does not match**: guest-tunnel looks for a pre-built fallback in this order:
-  1. `$GUEST_TUNNEL_SSH` environment variable (user override — always checked first)
-  2. `./ssh-fido2-{os}-{arch}` alongside the guest-tunnel binary
-  3. `$HOME/.local/bin/ssh-fido2`
-  4. Downloads `ssh-fido2-{os}-{arch}` from the current release, verifies its SHA256 against `sha256sums.txt`, writes it to a temp directory, and deletes it on exit.
+### About the bundled helper
 
-If no FIDO2-capable binary can be found or downloaded, guest-tunnel exits with a clear error rather than silently using a non-FIDO2 binary.
-
-### About the bundled binary
-
-- Built from upstream [OpenSSH V_9_8_P1](https://github.com/openssh/openssh-portable/tree/V_9_8_P1)
-- Compiled with `--with-security-key-builtin=yes` — FIDO2 is embedded in the binary itself, no runtime library dependencies
-- Does **not** use `--with-libfido2` (which would require libfido2 present at runtime)
-- Verified: `ssh-fido2-{os}-{arch} -Q key` prints `sk-ssh-ed25519@openssh.com` on a clean system with no extra libraries installed
+- The helper is a small wrapper around `ssh-agent`
+- It uses the FIDO2-capable SSH tooling bundled with the helper build, so the borrowed machine does not need to provide that support itself
+- It avoids depending on a system-wide agent setup
+- The bundled binary is there to make the agent lifecycle consistent, not to replace the user's SSH client
 
 ### Build it locally
 
 ```bash
-make ssh-local
-# Output: bin/ssh-fido2-{os}-{arch}
+make build
+# Output: dist/fido2-agent
 ```
 
 To use it as the override for local development:
 
 ```bash
-GUEST_TUNNEL_SSH=./bin/ssh-fido2-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') ./dist/guest-tunnel --mode=client
+GUEST_TUNNEL_FIDO2_AGENT=./bin/fido2-agent-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') ./dist/guest-tunnel --mode=client
 ```
 
 Or place it alongside the binary so it is picked up automatically:
 
 ```bash
-cp bin/ssh-fido2-darwin-arm64 dist/
+cp bin/fido2-agent-darwin-arm64 dist/
 ```
 
 ## Server setup

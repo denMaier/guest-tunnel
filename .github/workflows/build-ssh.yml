@@ -100,7 +100,7 @@ jobs:
 
       - name: Build
         working-directory: openssh-portable
-        run: make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu) ssh
+        run: make -j"$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)" ssh
 
       - name: Strip binary (Linux)
         if: matrix.os == 'linux'
