@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="${GT_CONTAINER_WORKDIR:-${TMPDIR:-/tmp}/guest-tunnel-container}"
 NETWORK_NAME="guest-tunnel-test"
-SSHD_IMAGE="guest-tunnel-test-sshd:latest"
-CLIENT_IMAGE="guest-tunnel-test-client:latest"
+TEST_IMAGE="guest-tunnel-test-env:latest"
 VPS_CONTAINER="guest-tunnel-vps"
 HOME_CONTAINER="guest-tunnel-home"
 CLIENT_CONTAINER="guest-tunnel-client"
@@ -94,8 +93,7 @@ ensure_system_started() {
 }
 
 build_images() {
-  container_cli build -t "${SSHD_IMAGE}" -f "${ROOT_DIR}/test/docker/sshd/Dockerfile" "${ROOT_DIR}"
-  container_cli build -t "${CLIENT_IMAGE}" -f "${ROOT_DIR}/test/docker/client/Dockerfile" "${ROOT_DIR}"
+  container_cli build -t "${TEST_IMAGE}" -f "${ROOT_DIR}/test/docker/Dockerfile" "${ROOT_DIR}"
 }
 
 ensure_network() {
@@ -131,11 +129,12 @@ start_vps() {
   container_cli run -d \
     --name "${VPS_CONTAINER}" \
     --network "${NETWORK_NAME}" \
+    --env GT_ROLE=vps \
     --env GT_WORKDIR=/work \
+    --env GT_VPS_HOST="${VPS_CONTAINER}" \
     --volume "${WORKDIR}:/work" \
-    --entrypoint /bin/bash \
-    "${SSHD_IMAGE}" \
-    /opt/guest-tunnel-test/vps/entrypoint.sh >/dev/null
+    --entrypoint /opt/guest-tunnel-test/entrypoint.sh \
+    "${TEST_IMAGE}" >/dev/null
   wait_for_exec "${VPS_CONTAINER}" "nc -z 127.0.0.1 22"
 }
 
@@ -145,13 +144,12 @@ start_home() {
   container_cli run -d \
     --name "${HOME_CONTAINER}" \
     --network "${NETWORK_NAME}" \
-    --env GT_START_REVERSE_TUNNEL=1 \
+    --env GT_ROLE=home \
     --env GT_WORKDIR=/work \
     --env GT_VPS_HOST="${vps_host}" \
     --volume "${WORKDIR}:/work" \
-    --entrypoint /bin/bash \
-    "${SSHD_IMAGE}" \
-    /opt/guest-tunnel-test/home/entrypoint.sh >/dev/null
+    --entrypoint /opt/guest-tunnel-test/entrypoint.sh \
+    "${TEST_IMAGE}" >/dev/null
   wait_for_exec "${HOME_CONTAINER}" "nc -z 127.0.0.1 22"
 }
 
@@ -160,11 +158,11 @@ start_client() {
   container_cli run -d \
     --name "${CLIENT_CONTAINER}" \
     --network "${NETWORK_NAME}" \
+    --env GT_ROLE=client \
     --env GT_WORKDIR=/work \
     --volume "${WORKDIR}:/work" \
-    --entrypoint /bin/bash \
-    "${CLIENT_IMAGE}" \
-    -lc "sleep infinity" >/dev/null
+    --entrypoint /opt/guest-tunnel-test/entrypoint.sh \
+    "${TEST_IMAGE}" >/dev/null
   wait_for_exec "${CLIENT_CONTAINER}" "true"
 }
 

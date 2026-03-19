@@ -75,22 +75,45 @@ cleanup_guest_tunnel() {
   gt_pid=""
 }
 
+run_installed_homelab_tunnel() {
+  local config_path="$1"
+  local setup_log="$2"
+  local tunnel_log="$3"
+  rm -f "${setup_log}" "${tunnel_log}"
+
+  printf '\n' | guest-tunnel --mode=client-setup --config "${config_path}" >"${setup_log}" 2>&1
+
+  "${HOME}/bin/homelab-tunnel" >"${tunnel_log}" 2>&1 &
+  gt_pid=$!
+}
+
 run_happy_path() {
-  local log_file="${log_dir}/happy.log"
-  rm -f "${log_file}"
+  local binary_log="${log_dir}/happy-binary.log"
+  local setup_log="${log_dir}/happy-setup.log"
+  local installed_log="${log_dir}/happy-installed.log"
+  rm -f "${binary_log}" "${setup_log}" "${installed_log}"
 
   if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
     fail "home loopback service should not be reachable without the tunnel"
   fi
 
-  run_guest_tunnel "${workdir}/config-good.yml" "${log_file}"
+  run_guest_tunnel "${workdir}/config-good.yml" "${binary_log}"
 
   wait_for_port 1080 || fail "guest-tunnel never opened the SOCKS port"
-  wait_for_log_text "Both gates cleared" "${log_file}" || fail "expected success banner in ${log_file}"
+  wait_for_log_text "Both gates cleared" "${binary_log}" || fail "expected success banner in ${binary_log}"
 
   local body
   body="$(curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/)"
   [[ "${body}" == *"guest-tunnel-home-ok"* ]] || fail "unexpected tunneled response: ${body}"
+
+  cleanup_guest_tunnel
+
+  run_installed_homelab_tunnel "${workdir}/config-good.yml" "${setup_log}" "${installed_log}"
+  wait_for_port 1080 || fail "homelab-tunnel never opened the SOCKS port"
+  wait_for_log_text "SOCKS5 tunnel up" "${installed_log}" || fail "expected installed-script success banner in ${installed_log}"
+
+  body="$(curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/)"
+  [[ "${body}" == *"guest-tunnel-home-ok"* ]] || fail "unexpected installed-script tunneled response: ${body}"
 
   cleanup_guest_tunnel
   echo "happy: ok"

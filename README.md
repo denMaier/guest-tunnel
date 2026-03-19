@@ -124,11 +124,14 @@ cp bin/fido2-agent-darwin-arm64 dist/
 Match User jumpuser
     AuthenticationMethods publickey
     PubkeyAuthentication yes
-    # No port forwarding — this user is only a jump host
-    AllowTcpForwarding no
+    # One user handles both flows:
+    # - homeserver reverse tunnel (-R <tunnel_port>:localhost:22)
+    # - client jump hop (-W localhost:<tunnel_port>)
+    AllowTcpForwarding yes
+    PermitOpen localhost:2222
+    PermitListen localhost:2222
     X11Forwarding no
     PermitTTY no
-    ForceCommand /bin/false
 ```
 
 Add the YubiKey's FIDO2 public key to both `~jumpuser/.ssh/authorized_keys` and `~tunneluser/.ssh/authorized_keys`:
@@ -214,6 +217,9 @@ The harness starts three Linux containers:
 - `home`: homeserver SSH daemon plus a reverse tunnel back to `vps`
 - `client`: runs `guest-tunnel` and validation checks
 
+All three now run from the same test image. Role-specific startup is selected by entrypoint environment (`GT_ROLE=vps|home|client`).
+The `vps` and `home` containers execute the real setup code paths (`--mode=server` and `--mode=home`) during boot, then start their runtime daemons.
+
 The homeserver container also exposes a loopback-only HTTP page on `127.0.0.1:8080`. The smoke test reaches that page through the SOCKS proxy, which proves Gate 2 is really working instead of just opening a local port.
 
 Run the happy-path check:
@@ -245,7 +251,7 @@ Useful helper commands:
 ./scripts/apple-container-integration.sh down
 ```
 
-The underlying images are still built from the Dockerfiles in [test/docker/client/Dockerfile](/Users/denis/Projects/Tunnel/test/docker/client/Dockerfile) and [test/docker/sshd/Dockerfile](/Users/denis/Projects/Tunnel/test/docker/sshd/Dockerfile), because Apple's `container build` consumes Dockerfiles directly.
+The single harness image is built from `test/docker/Dockerfile`.
 
 ### Repository secrets for GitHub Actions release
 

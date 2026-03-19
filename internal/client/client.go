@@ -164,7 +164,7 @@ Host homeserver
     HostName localhost
     Port %s
     User %s
-    ProxyJump vps
+    ProxyCommand ssh -W %%h:%%p vps
     ForwardAgent no
     ServerAliveInterval 30
     ServerAliveCountMax 3
@@ -279,8 +279,11 @@ verify_socks() {
     local socks_port=$1
     local max_attempts=${2:-20}
     for i in $(seq 1 $max_attempts); do
-        if curl --socks5-hostname 127.0.0.1:${socks_port} -m 2 -s -o /dev/null http://example.com 2>/dev/null; then
+        if nc -z 127.0.0.1 "${socks_port}" >/dev/null 2>&1; then
             return 0
+        fi
+        if ! kill -0 "$SSH_PID" 2>/dev/null; then
+            return 2
         fi
         echo -n "."
         sleep 1
@@ -289,10 +292,22 @@ verify_socks() {
 }
 
 echo -n "  Waiting for tunnel"
+verify_status=0
 if verify_socks "${SOCKS_PORT}"; then
     echo -e " ${GREEN}✓${RESET}"
 else
+    verify_status=$?
     echo ""
+    if [[ $verify_status -eq 2 ]]; then
+        exit_code=1
+        if wait "$SSH_PID"; then
+            exit_code=0
+        else
+            exit_code=$?
+        fi
+        echo -e "${YELLOW}[WARN]${RESET}  SSH exited before tunnel became ready (likely auth failure)." >&2
+        exit "$exit_code"
+    fi
     echo -e "${YELLOW}[WARN]${RESET}  Tunnel did not become ready — SSH may have failed." >&2
     echo -e "${YELLOW}[HINT]${RESET}  Check with: ssh -v -D ${SOCKS_PORT} homeserver" >&2
     exit 1

@@ -1,14 +1,18 @@
 package tunnel
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/agent"
@@ -17,6 +21,7 @@ import (
 var (
 	lookupSSHBin      = agent.SSHBin
 	startVerifiedConn = startVerifiedTunnelCommand
+	errSSHEarlyExit   = errors.New("ssh exited before SOCKS port became ready")
 )
 
 type Config struct {
@@ -172,20 +177,24 @@ func startVerifiedTunnelCommand(sshBin string, cfg Config, socksAddr, controlPat
 	}
 
 	cmd := exec.Command(sshBin, args...)
-	setCmdEnv(cmd, cfg)
+	stderrTail := newTailBuffer(8192)
+	setCmdEnv(cmd, cfg, stderrTail)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start ssh: %w", err)
 	}
 
-	if err := waitForPort(socksAddr, 10*time.Second); err != nil {
+	if err := waitForPortOrProcessExit(socksAddr, cmd, 10*time.Second); err != nil {
 		terminateTunnelCommand(cmd)
-		return nil, fmt.Errorf("SOCKS port did not become ready: %w", err)
+		if errors.Is(err, errSSHEarlyExit) {
+			return nil, fmt.Errorf("%w%s", errSSHEarlyExit, formatCapturedStderr(stderrTail.String()))
+		}
+		return nil, fmt.Errorf("SOCKS port did not become ready: %w%s", err, formatCapturedStderr(stderrTail.String()))
 	}
 
-	if err := verifyProxyWorks(socksAddr, "http://example.com", 20*time.Second); err != nil {
+	if err := verifyProxyWorks(socksAddr, 20*time.Second); err != nil {
 		terminateTunnelCommand(cmd)
-		return nil, fmt.Errorf("tunnel verification failed: %w", err)
+		return nil, fmt.Errorf("tunnel verification failed: %w%s", err, formatCapturedStderr(stderrTail.String()))
 	}
 
 	return cmd, nil
@@ -279,7 +288,7 @@ func buildProxyCommand(cfg Config) string {
 	return strings.Join(proxy, " ")
 }
 
-func setCmdEnv(cmd *exec.Cmd, cfg Config) {
+func setCmdEnv(cmd *exec.Cmd, cfg Config, stderrCapture io.Writer) {
 	env := os.Environ()
 	if sock := cfg.Auth.AgentSocket(); sock != "" {
 		env = append(env, "SSH_AUTH_SOCK="+sock)
@@ -287,7 +296,11 @@ func setCmdEnv(cmd *exec.Cmd, cfg Config) {
 	cmd.Env = env
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if stderrCapture != nil {
+		cmd.Stderr = io.MultiWriter(os.Stderr, stderrCapture)
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 }
 
 func ensureControlSocketDir() (string, error) {
@@ -337,23 +350,157 @@ func waitForPort(addr string, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for %s", addr)
 }
 
-func verifyProxyWorks(proxyAddr, testHost string, timeout time.Duration) error {
+func waitForPortOrProcessExit(addr string, cmd *exec.Cmd, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		cmd := exec.Command("curl",
-			"--socks5-hostname", proxyAddr,
-			"-m", "3",
-			"-s", "-o", "/dev/null", "-w", "%{http_code}",
-			testHost,
-		)
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			code := strings.TrimSpace(string(out))
-			if code == "200" || code == "301" || code == "302" || code == "400" || code == "401" || code == "403" || code == "404" || code == "407" || code == "502" || code == "503" {
-				return nil
-			}
+		if !processRunning(cmd) {
+			return errSSHEarlyExit
 		}
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			conn.Close()
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for %s", addr)
+}
+
+func processRunning(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	err := cmd.Process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, os.ErrProcessDone) {
+		return false
+	}
+	return true
+}
+
+func formatCapturedStderr(stderr string) string {
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		return ""
+	}
+	return "\nssh stderr:\n" + trimmed
+}
+
+type tailBuffer struct {
+	mu   sync.Mutex
+	max  int
+	data []byte
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	return &tailBuffer{max: max}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = append(b.data, p...)
+	if len(b.data) > b.max {
+		b.data = append([]byte(nil), b.data[len(b.data)-b.max:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(bytes.Clone(b.data))
+}
+
+func verifyProxyWorks(proxyAddr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		err := verifySOCKS5Connect(proxyAddr, "localhost", 22, 3*time.Second)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("proxy verification failed for %s through %s", testHost, proxyAddr)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timed out")
+	}
+	return fmt.Errorf("proxy verification failed for localhost:22 through %s: %w", proxyAddr, lastErr)
+}
+
+func verifySOCKS5Connect(proxyAddr, targetHost string, targetPort int, timeout time.Duration) error {
+	conn, err := net.DialTimeout("tcp", proxyAddr, timeout)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return fmt.Errorf("SOCKS5 greeting write failed: %w", err)
+	}
+
+	greetResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, greetResp); err != nil {
+		return fmt.Errorf("SOCKS5 greeting read failed: %w", err)
+	}
+	if greetResp[0] != 0x05 || greetResp[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 auth negotiation failed: version=%d method=%d", greetResp[0], greetResp[1])
+	}
+
+	host := []byte(targetHost)
+	if len(host) > 255 {
+		return fmt.Errorf("target host too long: %s", targetHost)
+	}
+
+	req := make([]byte, 0, 7+len(host))
+	req = append(req, 0x05, 0x01, 0x00, 0x03, byte(len(host)))
+	req = append(req, host...)
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, uint16(targetPort))
+	req = append(req, portBuf...)
+
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("SOCKS5 connect write failed: %w", err)
+	}
+
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return fmt.Errorf("SOCKS5 connect read failed: %w", err)
+	}
+	if header[0] != 0x05 {
+		return fmt.Errorf("unexpected SOCKS version: %d", header[0])
+	}
+	if header[1] != 0x00 {
+		return fmt.Errorf("SOCKS5 connect failed with code=%d", header[1])
+	}
+
+	var skip int
+	switch header[3] {
+	case 0x01:
+		skip = 4 + 2
+	case 0x03:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return fmt.Errorf("SOCKS5 addr length read failed: %w", err)
+		}
+		skip = int(lenBuf[0]) + 2
+	case 0x04:
+		skip = 16 + 2
+	default:
+		return fmt.Errorf("SOCKS5 response has unknown atyp=%d", header[3])
+	}
+
+	if skip > 0 {
+		discard := make([]byte, skip)
+		if _, err := io.ReadFull(conn, discard); err != nil {
+			return fmt.Errorf("SOCKS5 response read failed: %w", err)
+		}
+	}
+
+	return nil
 }

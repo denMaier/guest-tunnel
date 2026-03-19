@@ -293,12 +293,12 @@ Match User %s
     PasswordAuthentication no
     PubkeyAuthentication yes
     AllowAgentForwarding no
-    AllowTcpForwarding remote
+    AllowTcpForwarding yes
     X11Forwarding no
     PermitTTY no
-    ForceCommand /bin/false
+    PermitOpen localhost:%s
     PermitListen localhost:%s
-%s`, markerBegin, cfg.VPSUser, cfg.TunnelPort, markerEnd)
+%s`, markerBegin, cfg.VPSUser, cfg.TunnelPort, cfg.TunnelPort, markerEnd)
 
 	if strings.Contains(content, markerBegin) {
 		start := strings.Index(content, markerBegin)
