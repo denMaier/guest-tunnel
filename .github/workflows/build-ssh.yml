@@ -24,7 +24,7 @@ jobs:
             container: ''
           - os: darwin
             arch: amd64
-            runner: macos-13
+            runner: macos-15-intel
             container: ''
           - os: darwin
             arch: arm64
@@ -126,7 +126,7 @@ jobs:
           ls -lh ssh-fido2-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ssh-fido2-${{ matrix.os }}-${{ matrix.arch }}
           path: openssh-portable/ssh-fido2-${{ matrix.os }}-${{ matrix.arch }}

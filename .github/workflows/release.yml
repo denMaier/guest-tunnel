@@ -37,7 +37,7 @@ jobs:
         run: make cross VERSION=$VERSION
 
       - name: Download all ssh-fido2 artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: ssh-fido2-*
           path: dist/
