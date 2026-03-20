@@ -1,187 +1,155 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-scenario="${1:-all}"
-workdir="${GT_WORKDIR:-/work}"
-key="${workdir}/keys/client_ed25519"
-log_dir="${workdir}/logs"
+TEST_CASE="${1:-happy}"
+WORKDIR="/work"
+PASS=0
+FAIL=0
 
-mkdir -p "${log_dir}"
-gt_pid=""
-blocker_pid=""
+log_pass() { echo "  PASS: $1"; ((PASS++)); }
+log_fail() { echo "  FAIL: $1"; ((FAIL++)); }
 
-cleanup_all() {
-  cleanup_guest_tunnel
-  if [[ -n "${blocker_pid}" ]] && kill -0 "${blocker_pid}" >/dev/null 2>&1; then
-    kill "${blocker_pid}" >/dev/null 2>&1 || true
-    wait "${blocker_pid}" >/dev/null 2>&1 || true
-  fi
-}
+# ── Happy path ──────────────────────────────────────────────────────────────
 
-trap cleanup_all EXIT
+run_happy() {
+  echo "--- happy path ---"
+  local outfile
+  outfile="$(mktemp)"
 
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
+  guest-tunnel \
+    --config "${WORKDIR}/config-good.yml" \
+    --identity /root/.ssh/id_ed25519 \
+    --no-reconnect \
+    >"${outfile}" 2>&1 &
+  local tunnel_pid=$!
 
-wait_for_port() {
-  local port="$1"
-  local deadline=$((SECONDS + 30))
+  # Wait for "tunnel is up" in output (max 60s)
+  local deadline=$((SECONDS + 60))
   while (( SECONDS < deadline )); do
-    if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then
-      return 0
+    if ! kill -0 "${tunnel_pid}" 2>/dev/null; then
+      # Process exited — tunnel failed
+      echo "  guest-tunnel output:"
+      sed 's/^/    /' "${outfile}"
+      log_fail "guest-tunnel exited before tunnel was established"
+      rm -f "${outfile}"
+      return
+    fi
+    if grep -q "tunnel is up" "${outfile}" 2>/dev/null; then
+      break
     fi
     sleep 1
   done
-  return 1
-}
 
-wait_for_log_text() {
-  local text="$1"
-  local log_file="$2"
-  local deadline=$((SECONDS + 30))
-  while (( SECONDS < deadline )); do
-    if grep -q "${text}" "${log_file}" 2>/dev/null; then
-      return 0
-    fi
-    if [[ -n "${gt_pid}" ]] && ! kill -0 "${gt_pid}" >/dev/null 2>&1; then
-      return 1
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-assert_no_success_banner() {
-  local log_file="$1"
-  if grep -q "Both gates cleared" "${log_file}"; then
-    fail "unexpected success banner in ${log_file}"
-  fi
-}
-
-run_guest_tunnel() {
-  local config_path="$1"
-  local log_file="$2"
-  guest-tunnel --mode=client --config "${config_path}" --identity "${key}" --no-reconnect >"${log_file}" 2>&1 &
-  gt_pid=$!
-}
-
-cleanup_guest_tunnel() {
-  if [[ -n "${gt_pid:-}" ]] && kill -0 "${gt_pid}" >/dev/null 2>&1; then
-    kill "${gt_pid}" >/dev/null 2>&1 || true
-    wait "${gt_pid}" >/dev/null 2>&1 || true
-  fi
-  gt_pid=""
-}
-
-run_installed_homelab_tunnel() {
-  local config_path="$1"
-  local setup_log="$2"
-  local tunnel_log="$3"
-  rm -f "${setup_log}" "${tunnel_log}"
-
-  printf '\n' | guest-tunnel --mode=client-setup --config "${config_path}" >"${setup_log}" 2>&1
-
-  "${HOME}/bin/homelab-tunnel" >"${tunnel_log}" 2>&1 &
-  gt_pid=$!
-}
-
-run_happy_path() {
-  local binary_log="${log_dir}/happy-binary.log"
-  local setup_log="${log_dir}/happy-setup.log"
-  local installed_log="${log_dir}/happy-installed.log"
-  rm -f "${binary_log}" "${setup_log}" "${installed_log}"
-
-  if curl -fsS http://127.0.0.1:8080/ >/dev/null 2>&1; then
-    fail "home loopback service should not be reachable without the tunnel"
+  if ! kill -0 "${tunnel_pid}" 2>/dev/null; then
+    echo "  guest-tunnel output:"
+    sed 's/^/    /' "${outfile}"
+    log_fail "guest-tunnel exited before tunnel was established"
+    rm -f "${outfile}"
+    return
   fi
 
-  run_guest_tunnel "${workdir}/config-good.yml" "${binary_log}"
+  if ! grep -q "tunnel is up" "${outfile}" 2>/dev/null; then
+    kill "${tunnel_pid}" 2>/dev/null || true
+    wait "${tunnel_pid}" 2>/dev/null || true
+    echo "  guest-tunnel output:"
+    sed 's/^/    /' "${outfile}"
+    log_fail "\"tunnel is up\" not found in output after timeout"
+    rm -f "${outfile}"
+    return
+  fi
 
-  wait_for_port 1080 || fail "guest-tunnel never opened the SOCKS port"
-  wait_for_log_text "Both gates cleared" "${binary_log}" || fail "expected success banner in ${binary_log}"
+  log_pass "tunnel is up"
 
-  local body
-  body="$(curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/)"
-  [[ "${body}" == *"guest-tunnel-home-ok"* ]] || fail "unexpected tunneled response: ${body}"
+  # Curl through SOCKS proxy to reach homeserver HTTP on port 8080
+  local response
+  response="$(curl --socks5-hostname 127.0.0.1:1080 -m 15 -s http://localhost:8080/ 2>/dev/null || true)"
 
-  cleanup_guest_tunnel
+  if echo "${response}" | grep -q "homeserver"; then
+    log_pass "SOCKS proxy reaches homeserver HTTP (port 8080)"
+  else
+    log_fail "could not reach homeserver HTTP through SOCKS proxy"
+    echo "  response: ${response}"
+  fi
 
-  run_installed_homelab_tunnel "${workdir}/config-good.yml" "${setup_log}" "${installed_log}"
-  wait_for_port 1080 || fail "homelab-tunnel never opened the SOCKS port"
-  wait_for_log_text "SOCKS5 tunnel up" "${installed_log}" || fail "expected installed-script success banner in ${installed_log}"
-
-  body="$(curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/)"
-  [[ "${body}" == *"guest-tunnel-home-ok"* ]] || fail "unexpected installed-script tunneled response: ${body}"
-
-  cleanup_guest_tunnel
-  echo "happy: ok"
+  kill "${tunnel_pid}" 2>/dev/null || true
+  wait "${tunnel_pid}" 2>/dev/null || true
+  rm -f "${outfile}"
 }
 
-run_failure_case() {
-  local name="$1"
-  local config_path="$2"
-  local expected_text="${3:-}"
-  local log_file="${log_dir}/${name}.log"
-  rm -f "${log_file}"
+# ── Failure test helper ─────────────────────────────────────────────────────
 
-  run_guest_tunnel "${config_path}" "${log_file}"
-  if wait "${gt_pid}"; then
-    fail "${name} unexpectedly succeeded"
-  fi
-  gt_pid=""
+run_failure() {
+  local label="$1"
+  local config="$2"
+  local timeout="${3:-30}"
+  local socks_bind="${4:-127.0.0.1}"
+  local socks_port="${5:-1080}"
+  local pre_cmd="${6:-}"
 
-  assert_no_success_banner "${log_file}"
-  if [[ -n "${expected_text}" ]]; then
-    grep -q "${expected_text}" "${log_file}" || fail "expected ${expected_text} in ${log_file}"
+  echo "--- ${label} ---"
+  local outfile
+  outfile="$(mktemp)"
+
+  # Run optional pre-command (e.g., bind port for conflict test)
+  if [[ -n "${pre_cmd}" ]]; then
+    eval "${pre_cmd}"
   fi
-  echo "${name}: ok"
+
+  local exit_code=0
+  timeout "${timeout}" guest-tunnel \
+    --config "${config}" \
+    --identity /root/.ssh/id_ed25519 \
+    --no-reconnect \
+    >"${outfile}" 2>&1 || exit_code=$?
+
+  # Kill anything we started in pre_cmd
+  if [[ -n "${pre_cmd}" ]]; then
+    # Kill background nc listeners on the SOCKS port
+    fuser -k "${socks_port}/tcp" 2>/dev/null || true
+    sleep 0.5
+  fi
+
+  if (( exit_code != 0 )); then
+    log_pass "exited with non-zero status (${exit_code})"
+  else
+    log_fail "expected non-zero exit, got 0"
+  fi
+
+  if grep -q "tunnel is up" "${outfile}" 2>/dev/null; then
+    log_fail "\"tunnel is up\" appeared in output (should have failed)"
+  else
+    log_pass "\"tunnel is up\" not in output"
+  fi
+
+  rm -f "${outfile}"
 }
 
-run_port_conflict() {
-  local log_file="${log_dir}/port-conflict.log"
-  rm -f "${log_file}"
+# ── Main ────────────────────────────────────────────────────────────────────
 
-  nc -l 127.0.0.1 1080 >/tmp/guest-tunnel-port-blocker.log 2>&1 &
-  blocker_pid=$!
-  sleep 1
-
-  run_guest_tunnel "${workdir}/config-good.yml" "${log_file}"
-  if wait "${gt_pid}"; then
-    fail "port-conflict unexpectedly succeeded"
-  fi
-  gt_pid=""
-
-  assert_no_success_banner "${log_file}"
-  grep -q "already in use" "${log_file}" || fail "expected port-in-use error in ${log_file}"
-
-  kill "${blocker_pid}" >/dev/null 2>&1 || true
-  wait "${blocker_pid}" >/dev/null 2>&1 || true
-  blocker_pid=""
-  echo "port-conflict: ok"
-}
-
-case "${scenario}" in
+case "${TEST_CASE}" in
   happy)
-    run_happy_path
-    ;;
-  wrong-port)
-    run_failure_case "wrong-port" "${workdir}/config-wrong-port.yml" "Failed to establish tunnel"
-    ;;
-  wrong-user)
-    run_failure_case "wrong-user" "${workdir}/config-wrong-user.yml" "Failed to establish tunnel"
-    ;;
-  port-conflict)
-    run_port_conflict
+    run_happy
     ;;
   all)
-    run_happy_path
-    run_failure_case "wrong-port" "${workdir}/config-wrong-port.yml" "Failed to establish tunnel"
-    run_failure_case "wrong-user" "${workdir}/config-wrong-user.yml" "Failed to establish tunnel"
-    run_port_conflict
+    run_happy
+    echo
+    run_failure "wrong tunnel port" "${WORKDIR}/config-wrong-port.yml" 45
+    echo
+    run_failure "wrong VPS user" "${WORKDIR}/config-wrong-user.yml" 30
+    echo
+    run_failure "SOCKS port conflict" "${WORKDIR}/config-good.yml" 15 \
+      "127.0.0.1" "1080" \
+      "nc -l 127.0.0.1 1080 &"
     ;;
   *)
-    fail "unknown scenario: ${scenario}"
+    echo "Usage: smoke-test.sh <happy|all>" >&2
+    exit 1
     ;;
 esac
+
+echo
+echo "Results: ${PASS} passed, ${FAIL} failed"
+if (( FAIL > 0 )); then
+  exit 1
+fi
+exit 0

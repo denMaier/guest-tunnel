@@ -3,8 +3,6 @@ package ui
 import (
 	"fmt"
 	"os"
-
-	"github.com/yourusername/guest-tunnel/internal/config"
 )
 
 var (
@@ -75,8 +73,4 @@ func Print(msg string, args ...interface{}) {
 func PrintConnectionInfo(bind, port string) {
 	fmt.Printf("\n%s  SOCKS5 proxy: %s:%s%s\n", GREEN, bind, port, RESET)
 	fmt.Printf("%s  Example: curl --socks5-hostname %s:%s http://example.home%s\n\n", CYAN, bind, port, RESET)
-}
-
-func ExampleConfig() string {
-	return config.Example()
 }

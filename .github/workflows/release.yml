@@ -9,15 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  # Build FIDO2 SSH binaries for all four platforms.
-  # The reusable workflow inherits `contents: write` from this caller.
-  build-ssh:
-    uses: ./.github/workflows/build-ssh.yml
-    permissions:
-      contents: write
-
   release:
-    needs: [build-ssh]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -31,19 +23,12 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: Build guest-tunnel release binaries
+      - name: Build release binaries
         env:
           VERSION: ${{ github.ref_name }}
         run: make cross VERSION="$VERSION"
 
-      - name: Download all ssh-fido2 artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: ssh-fido2-*
-          path: dist/
-          merge-multiple: true
-
-      - name: Generate combined sha256sums.txt
+      - name: Generate sha256sums.txt
         run: |
           cd dist
           sha256sum \
@@ -51,10 +36,10 @@ jobs:
             guest-tunnel-darwin-arm64 \
             guest-tunnel-linux-amd64 \
             guest-tunnel-linux-arm64 \
-            ssh-fido2-darwin-amd64 \
-            ssh-fido2-darwin-arm64 \
-            ssh-fido2-linux-amd64 \
-            ssh-fido2-linux-arm64 \
+            fido2-agent-darwin-amd64 \
+            fido2-agent-darwin-arm64 \
+            fido2-agent-linux-amd64 \
+            fido2-agent-linux-arm64 \
             > sha256sums.txt
           cat sha256sums.txt
 
@@ -67,8 +52,8 @@ jobs:
             dist/guest-tunnel-darwin-arm64
             dist/guest-tunnel-linux-amd64
             dist/guest-tunnel-linux-arm64
-            dist/ssh-fido2-darwin-amd64
-            dist/ssh-fido2-darwin-arm64
-            dist/ssh-fido2-linux-amd64
-            dist/ssh-fido2-linux-arm64
+            dist/fido2-agent-darwin-amd64
+            dist/fido2-agent-darwin-arm64
+            dist/fido2-agent-linux-amd64
+            dist/fido2-agent-linux-arm64
             dist/sha256sums.txt

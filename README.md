@@ -6,7 +6,7 @@ Authenticated SOCKS5 tunnel to your homelab from any borrowed machine — no sud
 
 1. You `curl` a single pre-compiled binary (no install, runs from `/tmp`)
 2. The binary starts a private `ssh-agent` in memory
-3. A bundled `fido2-agent` helper uses `ssh-add -K` to load your YubiKey's resident FIDO2 key into that agent (never written to disk)
+3. A bundled `fido2-agent` helper starts a private `ssh-agent` and uses `ssh-add -K` to load your YubiKey's resident FIDO2 key into it (never written to disk)
 4. SSH authenticates through two independent gates — VPS jump host, then homeserver — each requiring the FIDO2 key
 5. A SOCKS5 proxy comes up on `localhost:1080`
 6. On exit, the agent is killed and all temp files are wiped
@@ -75,45 +75,33 @@ Insert your YubiKey, let the helper load resident keys, and touch it when prompt
 | YubiKey (FIDO2, resident key enrolled) | See enrollment below |
 | No sudo needed | Everything runs in userspace |
 
-## Embedded FIDO2 Helper
+## fido2-agent helper
 
-### Why bundle a helper?
+### What it does
 
-macOS and other borrowed machines do not always have a FIDO2-capable SSH stack available. To keep the client path reliable, guest-tunnel bundles a tiny `fido2-agent` helper that launches a private `ssh-agent` and uses the FIDO2-enabled bits needed to talk to a YubiKey resident key.
+`fido2-agent` is a small Go binary that:
 
-### How detection and fallback work
+1. Starts a private `ssh-agent` with a known socket path
+2. Runs `ssh-add -K` to load resident FIDO2 keys from your YubiKey into that agent
+3. Keeps the agent alive until you exit (Ctrl+C or when guest-tunnel shuts down)
 
-- **If `--yubikey` is set**: guest-tunnel starts the bundled helper path:
-  1. `./fido2-agent` alongside the guest-tunnel binary
-  2. `$HOME/.local/bin/fido2-agent`
-  3. A downloaded `fido2-agent-{os}-{arch}` from the current release, which you can verify by comparing its SHA256 to the value shown on the GitHub release page, written to a temp directory, and deleted on exit.
+It uses whatever `ssh-agent` and `ssh-add` are available on the system — it does not bundle or require a custom SSH build.
 
-If no FIDO2-capable helper can be found or downloaded, guest-tunnel exits with a clear error rather than silently falling back to a non-FIDO2 path.
+### How guest-tunnel finds it
 
-### About the bundled helper
+When `--yubikey` is set, guest-tunnel looks for `fido2-agent` in this order:
 
-- The helper is a small wrapper around `ssh-agent`
-- It uses the FIDO2-capable SSH tooling bundled with the helper build, so the borrowed machine does not need to provide that support itself
-- It avoids depending on a system-wide agent setup
-- The bundled binary is there to make the agent lifecycle consistent, not to replace the user's SSH client
+1. `GUEST_TUNNEL_FIDO2_AGENT` env var
+2. Next to the `guest-tunnel` binary
+3. On `$PATH`
+
+If no `fido2-agent` can be found, guest-tunnel exits with a clear error.
 
 ### Build it locally
 
 ```bash
 make build
 # Output: dist/fido2-agent
-```
-
-To use it as the override for local development:
-
-```bash
-GUEST_TUNNEL_FIDO2_AGENT=./bin/fido2-agent-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') ./dist/guest-tunnel --mode=client
-```
-
-Or place it alongside the binary so it is picked up automatically:
-
-```bash
-cp bin/fido2-agent-darwin-arm64 dist/
 ```
 
 ## Server setup
@@ -180,8 +168,8 @@ cd guest-tunnel
 # Build for current platform
 make build
 
-# Cross-compile all platforms + generate sha256sums
-make cross sha256sums
+# Cross-compile all platforms
+make cross
 ```
 
 ### Configuration
@@ -252,19 +240,6 @@ Useful helper commands:
 ```
 
 The single harness image is built from `test/docker/Dockerfile`.
-
-### Repository secrets for GitHub Actions release
-
-Set these in `Settings → Secrets → Actions`:
-
-| Secret | Value |
-|---|---|
-| `VPS_HOST` | Your VPS hostname |
-| `VPS_USER` | Jump user on VPS |
-| `HOME_USER` | Tunnel user on homeserver |
-| `TUNNEL_PORT` | Reverse tunnel port on VPS (e.g., 2222) |
-
-Tag a release (`git tag v1.0.0 && git push --tags`) to trigger the build.
 
 ## Security notes
 

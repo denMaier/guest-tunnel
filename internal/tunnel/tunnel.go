@@ -22,6 +22,15 @@ var (
 	lookupSSHBin      = agent.SSHBin
 	startVerifiedConn = startVerifiedTunnelCommand
 	errSSHEarlyExit   = errors.New("ssh exited before SOCKS port became ready")
+
+	// defaultSSHOptions are the common -o flags shared by every SSH invocation.
+	defaultSSHOptions = []string{
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+		"-o", "LogLevel=ERROR",
+	}
 )
 
 type Config struct {
@@ -211,17 +220,13 @@ func terminateTunnelCommand(cmd *exec.Cmd) {
 }
 
 func buildSSHArgs(cfg Config, socksAddr string) []string {
-	args := []string{
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "LogLevel=ERROR",
+	args := append([]string(nil), defaultSSHOptions...)
+	args = append(args,
 		"-o", fmt.Sprintf("ProxyCommand=%s", buildProxyCommand(cfg)),
 		"-N", "-T",
 		"-D", socksAddr,
 		"-p", cfg.TunnelPort,
-	}
+	)
 
 	switch {
 	case cfg.Auth.AgentSocket() != "":
@@ -235,12 +240,8 @@ func buildSSHArgs(cfg Config, socksAddr string) []string {
 }
 
 func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []string {
-	args := []string{
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "LogLevel=ERROR",
+	args := append([]string(nil), defaultSSHOptions...)
+	args = append(args,
 		"-o", fmt.Sprintf("ProxyCommand=%s", buildProxyCommand(cfg)),
 		"-o", "ControlMaster=auto",
 		"-o", fmt.Sprintf("ControlPath=%s", controlPath),
@@ -248,7 +249,7 @@ func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []
 		"-N", "-T",
 		"-D", socksAddr,
 		"-p", cfg.TunnelPort,
-	}
+	)
 
 	switch {
 	case cfg.Auth.AgentSocket() != "":
@@ -264,14 +265,7 @@ func buildSSHArgsWithControlMaster(cfg Config, socksAddr, controlPath string) []
 func buildProxyCommand(cfg Config) string {
 	target := fmt.Sprintf("%s@%s", cfg.VPSUser, cfg.VPSHost)
 
-	proxy := []string{
-		"ssh",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=15",
-		"-o", "ServerAliveCountMax=3",
-		"-o", "LogLevel=ERROR",
-	}
+	proxy := append([]string{"ssh"}, defaultSSHOptions...)
 
 	switch {
 	case cfg.Auth.AgentSocket() != "":

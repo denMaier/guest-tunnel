@@ -1,2 +1,21 @@
+# Build artifacts
+bin/
+dist/
+
+# macOS
 .DS_Store
-dist/fido2-agent
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go
+vendor/
+
+# Test / temp
+*.test
+*.out
+.coverage

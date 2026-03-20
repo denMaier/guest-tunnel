@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/config"
+	"github.com/yourusername/guest-tunnel/internal/sysutil"
 	"github.com/yourusername/guest-tunnel/internal/ui"
 )
 
@@ -72,7 +73,7 @@ func setupJumpUser(username string) {
 
 	if _, err := user.Lookup(username); err == nil {
 		ui.OK("%s already exists", username)
-		ensureServiceUserState(username, "/usr/sbin/nologin")
+		sysutil.EnsureServiceUserState(username, "/usr/sbin/nologin")
 		return
 	}
 
@@ -81,31 +82,8 @@ func setupJumpUser(username string) {
 		ui.Fatal("Failed to create %s: %v\n%s", username, err, out)
 	}
 
-	ensureServiceUserState(username, "/usr/sbin/nologin")
+	sysutil.EnsureServiceUserState(username, "/usr/sbin/nologin")
 	ui.OK("Created %s with /usr/sbin/nologin shell", username)
-}
-
-func ensureServiceUserState(username, shell string) {
-	// Some OpenSSH/PAM combinations reject pubkey auth for accounts that are
-	// present but password-locked. We explicitly keep the service user
-	// shell-restricted while making the account state usable for pubkey-only SSH.
-	runUsermodIfPossible(username, "--shell", shell)
-	runUsermodIfPossible(username, "--unlock")
-	runPasswdIfPossible(username, "--delete")
-}
-
-func runUsermodIfPossible(username string, args ...string) {
-	cmd := exec.Command("usermod", append(args, username)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		ui.Warn("Could not update %s with usermod %s: %v\n%s", username, strings.Join(args, " "), err, out)
-	}
-}
-
-func runPasswdIfPossible(username string, args ...string) {
-	cmd := exec.Command("passwd", append(args, username)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		ui.Warn("Could not update %s with passwd %s: %v\n%s", username, strings.Join(args, " "), err, out)
-	}
 }
 
 func setupSSHKeys(username string) {
@@ -120,7 +98,7 @@ func setupSSHKeys(username string) {
 	os.Chown(sshDir, 0, 0)
 	os.Chmod(sshDir, 0700)
 
-	existingKeys := readPublicKeys(authKeys)
+	existingKeys := sysutil.ReadPublicKeys(authKeys)
 
 	if len(existingKeys) > 0 {
 		ui.OK("%d key(s) already in authorized_keys — preserving existing access", len(existingKeys))
@@ -165,21 +143,6 @@ func setupSSHKeys(username string) {
 	os.Chown(authKeys, 0, 0)
 	os.Chmod(authKeys, 0600)
 	ui.OK("Public key installed for %s", username)
-}
-
-func readPublicKeys(path string) []string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var keys []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ssh-") || strings.HasPrefix(line, "ecdsa-") || strings.HasPrefix(line, "sk-") {
-			keys = append(keys, line)
-		}
-	}
-	return keys
 }
 
 func hardenSSH(cfg *config.Config) {

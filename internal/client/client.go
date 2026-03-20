@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/config"
 	"github.com/yourusername/guest-tunnel/internal/ui"
@@ -413,10 +414,5 @@ func writeScript(path, content string) {
 }
 
 func timestamp() string {
-	// Use time package would add an import; keep it simple with a proc read
-	out, err := exec.Command("date", "+%Y%m%d%H%M%S").Output()
-	if err != nil {
-		return "backup"
-	}
-	return strings.TrimSpace(string(out))
+	return time.Now().Format("20060102150405")
 }

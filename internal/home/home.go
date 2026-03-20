@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yourusername/guest-tunnel/internal/config"
+	"github.com/yourusername/guest-tunnel/internal/sysutil"
 	"github.com/yourusername/guest-tunnel/internal/ui"
 )
 
@@ -94,7 +95,7 @@ func setupTunnelUser() {
 
 	if _, err := user.Lookup("tunneluser"); err == nil {
 		ui.OK("tunneluser already exists")
-		ensureServiceUserState("tunneluser", "/usr/sbin/nologin")
+		sysutil.EnsureServiceUserState("tunneluser", "/usr/sbin/nologin")
 		return
 	}
 
@@ -103,30 +104,8 @@ func setupTunnelUser() {
 		ui.Fatal("Failed to create tunneluser: %v\n%s", err, out)
 	}
 
-	ensureServiceUserState("tunneluser", "/usr/sbin/nologin")
+	sysutil.EnsureServiceUserState("tunneluser", "/usr/sbin/nologin")
 	ui.OK("Created tunneluser")
-}
-
-func ensureServiceUserState(username, shell string) {
-	// Keep the service account non-interactive while ensuring OpenSSH does not
-	// reject it pre-auth as a fully locked account on stricter PAM setups.
-	runUsermodIfPossible(username, "--shell", shell)
-	runUsermodIfPossible(username, "--unlock")
-	runPasswdIfPossible(username, "--delete")
-}
-
-func runUsermodIfPossible(username string, args ...string) {
-	cmd := exec.Command("usermod", append(args, username)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		ui.Warn("Could not update %s with usermod %s: %v\n%s", username, strings.Join(args, " "), err, out)
-	}
-}
-
-func runPasswdIfPossible(username string, args ...string) {
-	cmd := exec.Command("passwd", append(args, username)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		ui.Warn("Could not update %s with passwd %s: %v\n%s", username, strings.Join(args, " "), err, out)
-	}
 }
 
 func generateSSHKey() {
@@ -167,7 +146,7 @@ func installClientPublicKey(cfg *config.Config) {
 	os.Chown(akDir, 0, 0)
 	os.Chmod(akDir, 0700)
 
-	existingKeys := readPublicKeys(akFile)
+	existingKeys := sysutil.ReadPublicKeys(akFile)
 	if len(existingKeys) > 0 {
 		ui.OK("%d client key(s) already installed — preserving existing access", len(existingKeys))
 		for _, k := range existingKeys {
@@ -205,21 +184,6 @@ func installClientPublicKey(cfg *config.Config) {
 	os.Chmod(akFile, 0600)
 
 	ui.OK("Client public key installed")
-}
-
-func readPublicKeys(path string) []string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var keys []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "ssh-") || strings.HasPrefix(line, "ecdsa-") || strings.HasPrefix(line, "sk-") {
-			keys = append(keys, line)
-		}
-	}
-	return keys
 }
 
 func testVPSConnection(cfg *config.Config) {

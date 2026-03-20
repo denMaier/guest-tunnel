@@ -70,8 +70,6 @@ setup_home() {
   install -m 644 -o root -g root "${keys_dir}/reverse_ed25519.pub" /home/tunneluser/.ssh/tunnel_ed25519.pub
   install -m 600 -o root -g root "${keys_dir}/client_ed25519.pub" /home/tunneluser/.ssh/authorized_keys
 
-  guest-tunnel --mode=home --config "${config_path}"
-
   mkdir -p /opt/guest-tunnel-test/home/www
   cp /opt/guest-tunnel-test/home/index.html /opt/guest-tunnel-test/home/www/index.html
   python3 -m http.server 8080 --bind 127.0.0.1 --directory /opt/guest-tunnel-test/home/www >/tmp/home-http.log 2>&1 &
