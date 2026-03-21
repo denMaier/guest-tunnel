@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/yourusername/guest-tunnel/internal/agent"
@@ -52,14 +53,15 @@ func main() {
 	}
 	flag.Parse()
 
+	if *versionFlag {
+		fmt.Println(Version)
+		os.Exit(0)
+	}
+
 	ui.Banner(Version)
 
 	switch *mode {
 	case "client":
-		if *versionFlag {
-			fmt.Println(Version)
-			os.Exit(0)
-		}
 		if *initFlag {
 			if err := writeExampleConfig(); err != nil {
 				ui.Fatal("Could not write example config: %v", err)
@@ -90,6 +92,10 @@ func runClient(configPath, agentSock, identity string, yubikey, noReconnect bool
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		ui.Fatal("%v\n\nRun with --init to create a starter config.", err)
+	}
+
+	if err := cfg.Validate("client"); err != nil {
+		ui.Fatal("Config error:\n  %v", err)
 	}
 	ui.OK("VPS:        %s@%s:%s", cfg.VPSUser, cfg.VPSHost, cfg.VPSPort)
 	ui.OK("Homeserver: %s@localhost:%s (via reverse tunnel)", cfg.HomeUser, cfg.TunnelPort)
@@ -179,20 +185,6 @@ func writeExampleConfig() error {
 	if err != nil {
 		return fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	dir := homeDir + "/.config/guest-tunnel"
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("cannot create %s: %w", dir, err)
-	}
-	dest := dir + "/config.yml"
-	if _, err := os.Stat(dest); err == nil {
-		fmt.Printf("Config already exists at %s\n", dest)
-		fmt.Println("Delete it first if you want to regenerate.")
-		return nil
-	}
-	if err := os.WriteFile(dest, []byte(config.Example()), 0600); err != nil {
-		return fmt.Errorf("cannot write %s: %w", dest, err)
-	}
-	fmt.Printf("Example config written to: %s\n\n", dest)
-	fmt.Println("Edit it with your VPS and homeserver details, then run guest-tunnel again.")
-	return nil
+	dest := filepath.Join(homeDir, ".config", "guest-tunnel", "config.yml")
+	return config.WriteExample(dest, "client")
 }

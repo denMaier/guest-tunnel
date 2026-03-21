@@ -62,8 +62,8 @@ func (t *Tunnel) Close() {
 		if t.stop != nil {
 			close(t.stop)
 		}
-		if t.cmd != nil {
-			terminateTunnelCommand(t.cmd)
+		if t.cmd != nil && t.cmd.Process != nil {
+			_ = t.cmd.Process.Kill()
 		}
 	})
 }
@@ -150,6 +150,11 @@ func establishWithReconnect(cfg Config) (*Tunnel, error) {
 			fmt.Printf("Tunnel exited: %v. Reconnecting...\n", err)
 			if useControlMaster {
 				cleanupControlSocket(controlPath, cfg)
+			}
+			select {
+			case <-tunnel.stop:
+				return
+			case <-time.After(2 * time.Second):
 			}
 		}
 	}()
@@ -315,10 +320,11 @@ func cleanupControlSocket(controlPath string, cfg Config) {
 		return
 	}
 	socketDir := filepath.Join(home, ".ssh", "sockets")
-	pattern := fmt.Sprintf("%s@%%h-%%p", cfg.VPSUser)
-	matches, _ := filepath.Glob(filepath.Join(socketDir, pattern))
+	matches, _ := filepath.Glob(filepath.Join(socketDir, "*"))
 	for _, m := range matches {
-		os.Remove(m)
+		if fi, err := os.Stat(m); err == nil && !fi.IsDir() {
+			os.Remove(m)
+		}
 	}
 }
 
@@ -329,19 +335,6 @@ func portFree(addr string) error {
 	}
 	ln.Close()
 	return nil
-}
-
-func waitForPort(addr string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			conn.Close()
-			return nil
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-	return fmt.Errorf("timed out waiting for %s", addr)
 }
 
 func waitForPortOrProcessExit(addr string, cmd *exec.Cmd, timeout time.Duration) error {

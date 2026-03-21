@@ -38,19 +38,24 @@ func Run(configPath *string, initFlag *bool) {
 		ui.Fatal("Failed to load config: %v", err)
 	}
 
+	if err := cfg.Validate("server"); err != nil {
+		ui.Fatal("Config error:\n  %v", err)
+	}
+
 	setupVPS(cfg)
 }
 
 func writeExampleConfig() {
-	fmt.Println(config.Example())
-	fmt.Println("\nEdit the config and save to /etc/guest-tunnel/config.yml")
+	if err := config.WriteExample("/etc/guest-tunnel/config.yml", "server"); err != nil {
+		ui.Fatal("Could not write example config: %v", err)
+	}
 }
 
 func setupVPS(cfg *config.Config) {
 	ui.Header("VPS Setup — Relay Node Configuration")
 
 	setupJumpUser(cfg.VPSUser)
-	setupSSHKeys(cfg.VPSUser)
+	setupSSHKeys(cfg)
 	hardenSSH(cfg)
 	installFail2ban()
 	restartSSH()
@@ -86,10 +91,10 @@ func setupJumpUser(username string) {
 	ui.OK("Created %s with /usr/sbin/nologin shell", username)
 }
 
-func setupSSHKeys(username string) {
+func setupSSHKeys(cfg *config.Config) {
 	ui.Step(2, "Installing authorized SSH keys...")
 
-	sshDir := filepath.Join("/home", username, ".ssh")
+	sshDir := filepath.Join("/home", cfg.VPSUser, ".ssh")
 	authKeys := filepath.Join(sshDir, "authorized_keys")
 
 	if err := os.MkdirAll(sshDir, 0700); err != nil {
@@ -110,17 +115,30 @@ func setupSSHKeys(username string) {
 			}
 			ui.Hint("  %s", comment)
 		}
-		ui.OK("Skipping key installation on rerun")
-		return
 	}
 
-	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		ui.Warn("No input — skipping key installation")
-		return
+	var key string
+	if cfg.LaptopPubKey != "" {
+		key = strings.TrimSpace(cfg.LaptopPubKey)
+		ui.OK("Using laptop_pubkey from config")
+	} else {
+		fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			ui.Warn("No input — skipping key installation")
+			return
+		}
+		key = strings.TrimSpace(scanner.Text())
+		if key != "" {
+			cfg.LaptopPubKey = key
+			if err := cfg.Save("/etc/guest-tunnel/config.yml"); err != nil {
+				ui.Warn("Could not save config: %v", err)
+			} else {
+				ui.OK("Saved laptop_pubkey to config for future non-interactive runs")
+			}
+		}
 	}
-	key := strings.TrimSpace(scanner.Text())
+
 	if key == "" {
 		ui.Warn("Empty key — skipping")
 		return
@@ -142,7 +160,7 @@ func setupSSHKeys(username string) {
 
 	os.Chown(authKeys, 0, 0)
 	os.Chmod(authKeys, 0600)
-	ui.OK("Public key installed for %s", username)
+	ui.OK("Public key installed for %s", cfg.VPSUser)
 }
 
 func hardenSSH(cfg *config.Config) {

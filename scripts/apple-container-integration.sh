@@ -84,7 +84,7 @@ network_exists() {
 
 delete_container_if_present() {
   if container_exists "$1"; then
-    container_cli delete --force "$1" >/dev/null
+    container_cli delete --force "$1" >/dev/null 2>&1 || true
   fi
 }
 
@@ -177,7 +177,7 @@ down_stack() {
   delete_container_if_present "${HOME_CONTAINER}"
   delete_container_if_present "${VPS_CONTAINER}"
   if network_exists "${NETWORK_NAME}"; then
-    container_cli network delete "${NETWORK_NAME}" >/dev/null
+    container_cli network delete "${NETWORK_NAME}" >/dev/null 2>&1 || true
   fi
 }
 

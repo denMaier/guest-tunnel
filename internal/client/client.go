@@ -26,13 +26,24 @@ const (
 // It does not require root.
 func Setup(configPath *string, initFlag *bool) {
 	if *initFlag {
-		fmt.Println(config.Example())
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			ui.Fatal("Cannot determine home directory: %v", err)
+		}
+		dest := filepath.Join(homeDir, ".config", "guest-tunnel", "config.yml")
+		if err := config.WriteExample(dest, "client"); err != nil {
+			ui.Fatal("Could not write example config: %v", err)
+		}
 		return
 	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		ui.Fatal("Failed to load config: %v", err)
+	}
+
+	if err := cfg.Validate("client"); err != nil {
+		ui.Fatal("Config error:\n  %v", err)
 	}
 
 	ui.Header("Client (Laptop) Setup — SSH Config and Tunnel Scripts")
@@ -56,7 +67,7 @@ func Setup(configPath *string, initFlag *bool) {
 	ui.Print("  Full homelab SOCKS5 proxy:   homelab-tunnel     → configure browser as shown")
 	ui.Print("")
 	ui.Print("Architecture:")
-	ui.Print("  laptop → (E2E encrypted) → VPS:22 (dumb relay) → homeserver:2222")
+	ui.Print("  laptop → (E2E encrypted) → VPS:22 (dumb relay) → homeserver:%s", cfg.TunnelPort)
 	ui.Print("  VPS sees only opaque ciphertext. Keys never leave your devices.")
 }
 
@@ -205,10 +216,18 @@ func writeOpencodeScript(cfg *config.Config, forwardPort string) {
 set -euo pipefail
 
 PORT=%s
-BOLD='\033[1m'; GREEN='\033[0;32m'; RESET='\033[0m'
+BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RESET='\033[0m'
+SSH_PID=""
 
-_cleanup() { echo -e "\n${BOLD}Tunnel closed.${RESET}"; exit 0; }
-trap _cleanup INT TERM
+_cleanup() {
+    local exit_code=$?
+    trap - EXIT INT TERM
+    [[ -n "${SSH_PID:-}" ]] && kill "$SSH_PID" 2>/dev/null || true
+    [[ -n "${SSH_PID:-}" ]] && wait "$SSH_PID" 2>/dev/null || true
+    echo -e "\n${BOLD}Tunnel closed.${RESET}"
+    exit "$exit_code"
+}
+trap _cleanup EXIT INT TERM
 
 echo -e "${GREEN}${BOLD}Starting tunnel: homeserver:${PORT} → localhost:${PORT}${RESET}"
 echo -e "${BOLD}OpenCode will be available at: http://localhost:${PORT}${RESET}"
@@ -265,12 +284,15 @@ BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RESE
 SSH_PID=""
 
 _cleanup() {
+    local exit_code=$?
+    trap - EXIT INT TERM
     echo -e "\n${BOLD}Closing homelab tunnel...${RESET}"
-    [[ -n $SSH_PID ]] && kill "$SSH_PID" 2>/dev/null || true
+    [[ -n "${SSH_PID:-}" ]] && kill "$SSH_PID" 2>/dev/null || true
+    [[ -n "${SSH_PID:-}" ]] && wait "$SSH_PID" 2>/dev/null || true
     echo -e "${BOLD}SOCKS5 tunnel closed.${RESET}"
-    exit 0
+    exit "$exit_code"
 }
-trap _cleanup INT TERM
+trap _cleanup EXIT INT TERM
 
 echo -e "${GREEN}${BOLD}Opening SOCKS5 tunnel → homeserver (localhost:${SOCKS_PORT})${RESET}"
 ssh -N -D "${SOCKS_PORT}" homeserver &

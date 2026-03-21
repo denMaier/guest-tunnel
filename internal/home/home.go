@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,12 +47,17 @@ func Run(configPath *string, initFlag *bool) {
 		ui.Fatal("Failed to load config: %v", err)
 	}
 
+	if err := cfg.Validate("home"); err != nil {
+		ui.Fatal("Config error:\n  %v", err)
+	}
+
 	setupHome(cfg)
 }
 
 func writeExampleConfig() {
-	fmt.Println(config.Example())
-	fmt.Println("\nEdit the config and save to /etc/guest-tunnel/config.yml")
+	if err := config.WriteExample("/etc/guest-tunnel/config.yml", "home"); err != nil {
+		ui.Fatal("Could not write example config: %v", err)
+	}
 }
 
 func setupHome(cfg *config.Config) {
@@ -66,9 +72,9 @@ func setupHome(cfg *config.Config) {
 	installAutossh()
 	populateKnownHosts(cfg)
 
-	useDropbear := chooseDaemon(daemon)
+	useDropbear := chooseDaemon(daemon, cfg)
 	if useDropbear {
-		setupDropbear(daemon.port)
+		setupDropbear(daemon.port, cfg)
 	} else {
 		ensureOpenSSH()
 	}
@@ -80,7 +86,7 @@ func setupHome(cfg *config.Config) {
 	ui.Print("  • tunneluser created (unprivileged, nologin shell)")
 	ui.Print("  • ed25519 keypair generated")
 	ui.Print("  • reverse-tunnel.service installed and running")
-	ui.Print("  • Tunnel: homeserver:22 → VPS:localhost:2222")
+	ui.Print("  • Tunnel: homeserver:22 → VPS:localhost:%s", cfg.TunnelPort)
 	if useDropbear {
 		ui.Print("  • Inbound daemon: Dropbear (password auth disabled: -s -g)")
 	} else {
@@ -137,13 +143,17 @@ func generateSSHKey() {
 func installClientPublicKey(cfg *config.Config) {
 	ui.Step(3, "Installing client public key...")
 
-	_ = cfg
-
 	akDir := "/home/tunneluser/.ssh"
 	akFile := akDir + "/authorized_keys"
 
 	os.MkdirAll(akDir, 0700)
-	os.Chown(akDir, 0, 0)
+	// sshd drops privileges to tunneluser before reading authorized_keys,
+	// so .ssh/ and authorized_keys must be owned by tunneluser.
+	if u, err := user.Lookup("tunneluser"); err == nil {
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+		os.Chown(akDir, uid, gid)
+	}
 	os.Chmod(akDir, 0700)
 
 	existingKeys := sysutil.ReadPublicKeys(akFile)
@@ -161,13 +171,28 @@ func installClientPublicKey(cfg *config.Config) {
 		return
 	}
 
-	fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		ui.Warn("No key provided - skipping")
-		return
+	var key string
+	if cfg.LaptopPubKey != "" {
+		key = strings.TrimSpace(cfg.LaptopPubKey)
+		ui.OK("Using laptop_pubkey from config")
+	} else {
+		fmt.Printf("\n  Paste the laptop's SSH public key (single line):\n  ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			ui.Warn("No key provided - skipping")
+			return
+		}
+		key = strings.TrimSpace(scanner.Text())
+		if key != "" {
+			cfg.LaptopPubKey = key
+			if err := cfg.Save("/etc/guest-tunnel/config.yml"); err != nil {
+				ui.Warn("Could not save config: %v", err)
+			} else {
+				ui.OK("Saved laptop_pubkey to config for future non-interactive runs")
+			}
+		}
 	}
-	key := strings.TrimSpace(scanner.Text())
+
 	if key == "" {
 		ui.Warn("No key provided - skipping")
 		return
@@ -180,7 +205,11 @@ func installClientPublicKey(cfg *config.Config) {
 	f.WriteString(key + "\n")
 	f.Close()
 
-	os.Chown(akFile, 0, 0)
+	if u, err := user.Lookup("tunneluser"); err == nil {
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+		os.Chown(akFile, uid, gid)
+	}
 	os.Chmod(akFile, 0600)
 
 	ui.OK("Client public key installed")
@@ -336,7 +365,7 @@ func sshdListenPort(fallback string) string {
 	return fallback
 }
 
-func chooseDaemon(current sshDaemon) bool {
+func chooseDaemon(current sshDaemon, cfg *config.Config) bool {
 	if current.kind == "dropbear" {
 		ui.Step(7, "Selecting SSH daemon...")
 		ui.OK("Dropbear already active on port %s — preserving current daemon", current.port)
@@ -349,6 +378,18 @@ func chooseDaemon(current sshDaemon) bool {
 		return false
 	}
 
+	// Non-interactive: use config value
+	if cfg.SSHDaemon != "" {
+		ui.Step(7, "Selecting SSH daemon...")
+		d := strings.ToLower(cfg.SSHDaemon)
+		if d == "openssh" {
+			ui.OK("Using ssh_daemon from config: openssh")
+			return false
+		}
+		ui.OK("Using ssh_daemon from config: dropbear")
+		return true
+	}
+
 	ui.Header("SSH Server Selection")
 	fmt.Println("  Choose the SSH server to run on this homeserver:")
 	fmt.Printf("  %s1) OpenSSH%s  — standard, full-featured, larger codebase\n", ui.BOLD, ui.RESET)
@@ -356,10 +397,18 @@ func chooseDaemon(current sshDaemon) bool {
 	fmt.Println()
 	fmt.Print("  Choice [1/2, default 2 (Dropbear recommended)]: ")
 	scanner := bufio.NewScanner(os.Stdin)
-	if scanner.Scan() {
-		return strings.TrimSpace(scanner.Text()) != "1"
+	chooseOpenSSH := scanner.Scan() && strings.TrimSpace(scanner.Text()) == "1"
+
+	if chooseOpenSSH {
+		cfg.SSHDaemon = "openssh"
+	} else {
+		cfg.SSHDaemon = "dropbear"
 	}
-	return true
+	if err := cfg.Save("/etc/guest-tunnel/config.yml"); err != nil {
+		ui.Warn("Could not save config: %v", err)
+	}
+
+	return !chooseOpenSSH
 }
 
 func ensureOpenSSH() {
@@ -384,7 +433,7 @@ func ensureOpenSSH() {
 	ui.Warn("Could not enable OpenSSH — check manually")
 }
 
-func setupDropbear(currentPort string) {
+func setupDropbear(currentPort string, cfg *config.Config) {
 	ui.Header("Installing Dropbear SSH Server")
 
 	installDropbear()
@@ -394,7 +443,7 @@ func setupDropbear(currentPort string) {
 	if isUnitActive("dropbear-ssh") {
 		ui.OK("Keeping existing Dropbear listen port %s", dbPort)
 	} else {
-		dbPort = promptPort(currentPort)
+		dbPort = promptPort(currentPort, cfg)
 	}
 
 	writeDropbearService(dbPort)
@@ -406,7 +455,7 @@ func setupDropbear(currentPort string) {
 		return
 	}
 
-	testDropbear(dbPort)
+	testDropbear(dbPort, cfg)
 	cutoverToDropbear(dbPort)
 }
 
@@ -456,12 +505,20 @@ func convertHostKey() {
 	}
 }
 
-func promptPort(current string) string {
+func promptPort(current string, cfg *config.Config) string {
+	if cfg.DropbearPort != "" {
+		ui.OK("Using dropbear_port from config: %s", cfg.DropbearPort)
+		return cfg.DropbearPort
+	}
 	fmt.Printf("  Port for Dropbear to listen on [%s]: ", current)
 	scanner := bufio.NewScanner(os.Stdin)
 	if scanner.Scan() {
 		p := strings.TrimSpace(scanner.Text())
 		if p != "" {
+			cfg.DropbearPort = p
+			if err := cfg.Save("/etc/guest-tunnel/config.yml"); err != nil {
+				ui.Warn("Could not save config: %v", err)
+			}
 			return p
 		}
 	}
@@ -498,7 +555,12 @@ WantedBy=multi-user.target
 	ui.OK("dropbear-ssh.service written (password auth disabled)")
 }
 
-func testDropbear(realPort string) {
+func testDropbear(realPort string, cfg *config.Config) {
+	if cfg.SkipTest {
+		ui.Step(8, "Skipping Dropbear interactive test (skip_test: true)")
+		return
+	}
+
 	ui.Header(fmt.Sprintf("Testing Dropbear on temporary port %s", testPort))
 	ui.Print("  Starting Dropbear alongside OpenSSH for verification...")
 
@@ -602,13 +664,13 @@ Type=simple
 User=tunneluser
 Environment=AUTOSSH_GATETIME=0
 Environment=AUTOSSH_PATH=/usr/bin/ssh
-ExecStart=/usr/bin/autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -i %s -R 2222:localhost:22 %s
+ExecStart=/usr/bin/autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -i %s -R %s:localhost:22 %s
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-`, keyFile, vpsAddr)
+`, keyFile, cfg.TunnelPort, vpsAddr)
 
 	existing, _ := os.ReadFile(rvService)
 	if string(existing) == content {
