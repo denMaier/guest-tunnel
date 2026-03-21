@@ -93,6 +93,33 @@ run_failure() {
   # Run optional pre-command (e.g., bind port for conflict test)
   if [[ -n "${pre_cmd}" ]]; then
     eval "${pre_cmd}"
+    # Verify the port holder is actually binding the port before proceeding.
+    # Try to bind the same port — if it fails, something is already listening (good).
+    if [[ -n "${socks_port}" ]]; then
+      local verify_deadline=$((SECONDS + 5))
+      local port_bound=0
+      while (( SECONDS < verify_deadline )); do
+        if python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(('${socks_bind}', ${socks_port}))
+    s.close()
+    sys.exit(1)  # port is free — pre_cmd not holding it yet
+except OSError:
+    sys.exit(0)  # port in use — good
+" 2>/dev/null; then
+          port_bound=1
+          break
+        fi
+        sleep 0.1
+      done
+      if (( port_bound == 0 )); then
+        log_fail "pre_cmd did not bind port ${socks_bind}:${socks_port}"
+        rm -f "${outfile}"
+        return
+      fi
+    fi
   fi
 
   local exit_code=0
